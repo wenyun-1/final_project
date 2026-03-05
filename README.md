@@ -28,6 +28,7 @@ python soh_final_pipeline.py --epochs 120 --smooth-window 15 --output outputs_fi
 
 - `outputs_final/soh_metrics_vehicle.csv`（按车辆）
 - `outputs_final/soh_metrics_summary.csv`（均值/标准差）
+- `outputs_final/soh_predictions_points.csv`（每个测试点的 True/Raw/Filtered）
 - `outputs_final/SOH_Predictions_For_SOC.csv`（供第四章SOC模型输入）
 - `outputs_final/*_pseudo_labels.csv`（伪标签轨迹，可直接做论文图）
 
@@ -41,12 +42,37 @@ python soh_final_pipeline.py --epochs 120 --smooth-window 15 --output outputs_fi
 python ablation_template.py --epochs 80 --output outputs_ablation
 ```
 
+如果希望消融结束后自动出图：
+
+```bash
+python ablation_template.py --epochs 80 --output outputs_ablation --plot
+```
+
 输出：
 
 - `outputs_ablation/ablation_results.csv`（完整汇总）
 - `outputs_ablation/ablation_results_paper.csv`（论文友好精简表）
 
-> 你可以在 `ablation_template.py` 的 `grid` 里继续扩展维度（比如电压窗口、物理损失权重）。
+## 第三章结果图绘制（无需再次训练）
+
+如果你已经有以下文件：
+- `outputs_final/SOH_Predictions_For_SOC.csv`
+- `outputs_final/soh_metrics_vehicle.csv`
+- `outputs_final/*_pseudo_labels.csv`
+
+可直接画第三章主图（子图排版，黑点真值 + 红线预测，标题含 `车辆名 + RMSE_filtered + R²_filtered`）：
+
+```bash
+python plot_experiment_results.py --soh-output outputs_final --ablation-output outputs_ablation --out-dir figures
+```
+
+主要输出：
+- `figures/chapter3_soh_subplot.png`
+- `figures/soh_metric_compare.png`
+- `figures/ablation_compare.png`（若提供了消融结果）
+
+> 其中 `chapter3_soh_subplot.png` 会优先使用 `soh_predictions_points.csv`；
+> 若没有该文件，会自动回退到 `SOH_Predictions_For_SOC.csv + *_pseudo_labels.csv` 对齐绘图（无需重训）。
 
 ## 数据体检（轻量，不依赖 pandas/torch）
 

@@ -228,6 +228,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
     all_metrics = []
     all_soc_export = []
+    all_point_export = []
 
     for veh, frame in vehicle_frames.items():
         if len(frame) < 30:
@@ -288,8 +289,15 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         }
         all_metrics.append(metrics)
 
-        for d, s in zip(days, y_pred_filtered):
-            all_soc_export.append({"Vehicle": veh, "Days": int(d), "Pred_SOH": float(s / 100.0)})
+        for d, yt, yr, yf in zip(days, y_true, y_pred, y_pred_filtered):
+            all_point_export.append({
+                "Vehicle": veh,
+                "Days": int(d),
+                "SOH_true": float(yt),
+                "SOH_pred_raw": float(yr),
+                "SOH_pred_filtered": float(yf),
+            })
+            all_soc_export.append({"Vehicle": veh, "Days": int(d), "Pred_SOH": float(yf / 100.0)})
 
     metric_df = pd.DataFrame(all_metrics)
     if not metric_df.empty:
@@ -300,6 +308,10 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
             "Std": [metric_df[c].std(ddof=1) if len(metric_df) > 1 else 0.0 for c in ["RMSE_raw", "MAE_raw", "R2_raw", "RMSE_filtered", "MAE_filtered", "R2_filtered"]],
         }
         pd.DataFrame(summary).to_csv(os.path.join(output_dir, "soh_metrics_summary.csv"), index=False)
+
+    point_df = pd.DataFrame(all_point_export)
+    if not point_df.empty:
+        point_df.to_csv(os.path.join(output_dir, "soh_predictions_points.csv"), index=False)
 
     soc_df = pd.DataFrame(all_soc_export)
     if not soc_df.empty:
@@ -357,6 +369,7 @@ def main() -> None:
     print(f"- {args.output}/soh_metrics_vehicle.csv")
     print(f"- {args.output}/soh_metrics_summary.csv")
     print(f"- {args.output}/SOH_Predictions_For_SOC.csv")
+    print(f"- {args.output}/soh_predictions_points.csv")
 
 
 if __name__ == "__main__":

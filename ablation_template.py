@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--output", default="outputs_ablation")
     parser.add_argument("--python", default="python")
+    parser.add_argument("--plot", action="store_true", help="完成后自动生成消融对比图")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -88,6 +89,9 @@ def main() -> None:
     print("✅ 消融模板执行完毕，已导出：")
     print(f"- {args.output}/ablation_results.csv")
     print(f"- {args.output}/ablation_results_paper.csv")
+
+    if args.plot:
+        run_cmd([args.python, "plot_experiment_results.py", "--ablation-output", args.output, "--out-dir", os.path.join(args.output, "figures")])
 
 
 if __name__ == "__main__":
