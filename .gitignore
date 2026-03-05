@@ -1,0 +1,41 @@
+# 大数据不进仓库
+data/
+data1/
+*.csv
+
+# 允许放小样本（建议放到 samples/ 目录，而不是 data/）
+samples/
+!samples/**
+
+# 可选：一些常见缓存
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 运行输出目录
+outputs_ablation/
+outputs_final/
+
+# 常见缓存/临时
+*.log
+*.tmp
+*.bak
+
+# 避免误生成的“奇怪文件名”（保险起见）
+0
+1
+10
+15.0
+20
+30
+60
+None
+pd.DataFrame
+MAX_CURRENT_FLUCTUATION
+MAX_TIME_GAP_SECONDS
+V_START
+V_END
+V_END)
+cfg.max_gap_seconds
+cfg.min_seg_points
+idx_s
