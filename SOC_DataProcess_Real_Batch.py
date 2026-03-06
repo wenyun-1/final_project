@@ -13,7 +13,48 @@ SOH_MAPPING_FILE = "D:/研究/1-大论文/数据集/第三章/SOH_Predictions_Fo
 USE_COLS = ['DATA_TIME', 'totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC']
 MIN_VALID_VOLTAGE = 100.0 
 GAP_THRESHOLD_SEC = 1800 
+SOH_BASE_DATE = "2020-01-01"
+INITIAL_SOH_POLICY = "drop_until_first_valid"  # "drop_until_first_valid" 或 "fill_default"
+DEFAULT_INITIAL_SOH = 1.0
 # ===========================================
+
+
+def _prepare_soh_trajectory(soh_mapping_df, veh_name):
+    """
+    统一整理某辆车 SOH 时间轨迹，供 merge_asof(direction='backward') 前向保持使用。
+    优先读取真实时间戳；若只有 Days 列，则退化为基准日+天数。
+    """
+    veh_soh = soh_mapping_df[soh_mapping_df['Vehicle'] == veh_name].copy()
+    if len(veh_soh) == 0:
+        return veh_soh
+
+    # 若有“完整充电 / 有效估计”标记，优先过滤，避免碎片充电污染 SOH 更新点
+    for valid_col in ['Is_Valid', 'is_valid', 'Valid', 'valid', 'Is_Complete_Charge', 'is_complete_charge']:
+        if valid_col in veh_soh.columns:
+            veh_soh = veh_soh[veh_soh[valid_col].astype(str).isin(['1', 'True', 'true'])].copy()
+            break
+
+    if len(veh_soh) == 0:
+        return veh_soh
+
+    if 'Pred_SOH' not in veh_soh.columns:
+        raise KeyError("SOH 映射表缺少 Pred_SOH 列，无法注入 SOC 训练数据。")
+
+    if 'Charge_End_Time' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['Charge_End_Time'], errors='coerce')
+    elif 'DATA_TIME' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['DATA_TIME'], errors='coerce')
+    elif 'Timestamp' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['Timestamp'], errors='coerce')
+    elif 'Days' in veh_soh.columns:
+        # 兼容仅有“天级索引”的映射文件
+        veh_soh['SOH_TIME'] = pd.to_datetime(SOH_BASE_DATE) + pd.to_timedelta(veh_soh['Days'], unit='D')
+    else:
+        raise KeyError("SOH 映射表缺少可用于时间对齐的列（Charge_End_Time/DATA_TIME/Timestamp/Days）。")
+
+    veh_soh = veh_soh.dropna(subset=['SOH_TIME', 'Pred_SOH']).copy()
+    veh_soh = veh_soh.sort_values('SOH_TIME')
+    return veh_soh[['SOH_TIME', 'Pred_SOH']]
 
 def process_integrated():
     csv_files = glob.glob(os.path.join(DATA_FOLDER_PATH, "*.csv"))
@@ -53,24 +94,39 @@ def process_integrated():
             df['Cycle_ID'] = internal_cycle_ids + global_cycle_offset
             global_cycle_offset = df['Cycle_ID'].max()
 
-            # ================= ⚡️ 核心合龙逻辑：多时间尺度对齐 ⚡️ =================
-            # 计算每一行高频数据对应的宏观“天数 (Days)”
-            df['Days'] = (df['DATA_TIME'] - pd.Timestamp("2020-01-01")).dt.days
-            
-            # 从映射表中取出该车专属的老化轨迹
-            veh_soh_trajectory = soh_mapping[soh_mapping['Vehicle'] == veh_name].copy()
-            
+            # ================= ⚡️ 核心合龙逻辑：SOH 前向保持（零阶保持）⚡️ =================
+            # 用“最近一次完成充电计算出的 SOH”对后续放电高频数据做方向为 backward 的时间对齐，
+            # 从而严格满足在线因果性，避免未来 SOH 泄露。
+            df = df.sort_values('DATA_TIME').reset_index(drop=True)
+            veh_soh_trajectory = _prepare_soh_trajectory(soh_mapping, veh_name)
+
             if len(veh_soh_trajectory) > 0:
-                # 按照“天数”进行就近匹配 (因为高频数据是按秒的，SOH是按天的)
-                veh_soh_trajectory = veh_soh_trajectory.sort_values('Days')
-                df = pd.merge_asof(df, veh_soh_trajectory[['Days', 'Pred_SOH']], on='Days', direction='nearest')
+                df = pd.merge_asof(
+                    df,
+                    veh_soh_trajectory,
+                    left_on='DATA_TIME',
+                    right_on='SOH_TIME',
+                    direction='backward',
+                    allow_exact_matches=True,
+                )
                 df['SOH'] = df['Pred_SOH']
-                print(f"    ✅ 成功注入第3章 PI-UAE 老化参数! SOH 范围: {df['SOH'].min():.3f} ~ {df['SOH'].max():.3f}")
+
+                if INITIAL_SOH_POLICY == 'fill_default':
+                    df['SOH'] = df['SOH'].fillna(DEFAULT_INITIAL_SOH)
+                elif INITIAL_SOH_POLICY == 'drop_until_first_valid':
+                    df = df[df['SOH'].notna()].copy()
+                else:
+                    raise ValueError(f"未知 INITIAL_SOH_POLICY: {INITIAL_SOH_POLICY}")
+
+                if len(df) == 0:
+                    print("    ⚠️ 当前文件所有数据都早于首个有效 SOH 更新点，已跳过。")
+                    continue
+
+                print(f"    ✅ 已按前向保持注入 SOH（backward asof），SOH 范围: {df['SOH'].min():.3f} ~ {df['SOH'].max():.3f}")
             else:
-                # 如果这辆车没在第三章处理过，赋予默认值 1.0
-                df['SOH'] = 1.0
-                print(f"    ⚠️ 警告：映射表中没有该车的老化记录，已默认填充 SOH=1.0")
-            # ====================================================================
+                df['SOH'] = DEFAULT_INITIAL_SOH
+                print(f"    ⚠️ 映射表中无该车有效 SOH 轨迹，已默认填充 SOH={DEFAULT_INITIAL_SOH:.3f}")
+            # ======================================================================================
 
             temp_mean = ((df['maxTemperature'] + df['minTemperature']) / 2).ffill()
             final_df = pd.DataFrame({

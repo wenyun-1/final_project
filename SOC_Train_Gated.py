@@ -5,8 +5,8 @@ import numpy as np
 import time
 
 # 引入我们刚才写的类
-from AttentionGRU_Gated import SOH_Gated_GRU
-from RealVehicleDataset import RealVehicleDataset
+from SOC_AttentionGRU_Gated import SOH_Gated_GRU
+from SOC_RealVehicleDataset import RealVehicleDataset
 
 # ================= 参数配置 =================
 BATCH_SIZE = 512       # 批次大小，显存够大可以改到 1024
