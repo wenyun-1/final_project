@@ -94,27 +94,3 @@ python analyze_samples.py
 
 消融实验**不是在比较不同SOH建模方法**，而是在固定终极路线下比较“平滑窗口+随机种子”的稳定性。
 脚本会自动标注并输出推荐设置（按 `RMSE_filtered_mean` 最小）。
-
-
-## 一键重训并输出Top6（按RMSE_filtered最小）
-
-你可以直接运行：
-
-```bash
-python run_best_soh_experiment.py --search-root outputs_search --final-output outputs_final_best --figure figures/chapter3_top6_soh.png
-```
-
-该脚本会自动：
-1. 用扩展网格做30轮快速筛选（`sw=[9,11,13,15,17]`, `seed=[42,3407,2025]`）
-2. 以 `RMSE_filtered_mean` 最小选“搜索空间内最优”参数
-3. 用最优参数进行150轮最终重训
-4. 按 `RMSE_filtered` 最小选6辆车，输出3行2列子图：
-   - 灰色散点：估计散点（raw，体现波动）
-   - 红色曲线：SOH下降趋势（filtered）
-   - 子图命名：`EV1`~`EV6`（按性能排名）
-
-主要输出：
-- `outputs_search/expanded_search_results.csv`
-- `outputs_final_best/best_config.txt`
-- `outputs_final_best/top6_vehicle_alias.csv`
-- `figures/chapter3_top6_soh.png`
