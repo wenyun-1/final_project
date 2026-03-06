@@ -2,7 +2,7 @@ import pandas as pd
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from AttentionGRU_Gated import SOH_Gated_GRU
+from SOC_AttentionGRU_Gated import SOH_Gated_GRU
 
 # ================= 配置 =================
 TEST_FILE_PATH = "D:/研究/1-大论文/数据集/TEG6105BEV13_LFP604/data/TEG6105BEV13_LFP604EV8sample.csv"

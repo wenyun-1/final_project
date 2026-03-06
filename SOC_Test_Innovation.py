@@ -2,7 +2,7 @@ import pandas as pd
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from AttentionGRU_Gated import SOH_Gated_GRU
+from SOC_AttentionGRU_Gated import SOH_Gated_GRU
 
 # ================= 配置区域 =================
 # 建议挑一辆老化明显的车，比如 EV8
@@ -26,16 +26,33 @@ def run_integrated_test():
     df = df.dropna(subset=['totalVoltage'])
     df = df[df['totalVoltage'] > 100].reset_index(drop=True)
     df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'])
-    df['Days'] = (df['DATA_TIME'] - pd.Timestamp("2020-01-01")).dt.days
     
     # ⚡️ 截取该车辆寿命最末期的一段动态放电数据 (比如最后一万个点中的一段)
     test_segment = df.iloc[-10000:-8000].reset_index(drop=True)
     
     # 注入第三章的 SOH 预测先验
     soh_mapping = pd.read_csv(SOH_MAPPING_FILE)
-    veh_soh = soh_mapping[soh_mapping['Vehicle'] == veh_name].sort_values('Days')
-    test_segment = pd.merge_asof(test_segment, veh_soh[['Days', 'Pred_SOH']], on='Days', direction='nearest')
-    test_segment['SOH'] = test_segment['Pred_SOH']
+    veh_soh = soh_mapping[soh_mapping['Vehicle'] == veh_name].copy()
+    if 'Charge_End_Time' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['Charge_End_Time'], errors='coerce')
+    elif 'DATA_TIME' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['DATA_TIME'], errors='coerce')
+    elif 'Days' in veh_soh.columns:
+        veh_soh['SOH_TIME'] = pd.Timestamp("2020-01-01") + pd.to_timedelta(veh_soh['Days'], unit='D')
+    else:
+        raise KeyError("SOH 映射文件缺少 Charge_End_Time/DATA_TIME/Days，无法做前向保持注入。")
+
+    veh_soh = veh_soh.dropna(subset=['SOH_TIME', 'Pred_SOH']).sort_values('SOH_TIME')
+    test_segment = test_segment.sort_values('DATA_TIME').reset_index(drop=True)
+    test_segment = pd.merge_asof(
+        test_segment,
+        veh_soh[['SOH_TIME', 'Pred_SOH']],
+        left_on='DATA_TIME',
+        right_on='SOH_TIME',
+        direction='backward',
+        allow_exact_matches=True,
+    )
+    test_segment['SOH'] = test_segment['Pred_SOH'].ffill().fillna(1.0)
     actual_soh_value = test_segment['SOH'].mean()
     print(f"   -> 截取时间段平均老化 SOH = {actual_soh_value*100:.2f}%")
 
