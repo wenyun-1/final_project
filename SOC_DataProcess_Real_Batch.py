@@ -1,30 +1,59 @@
-import pandas as pd
-import numpy as np
-import os
-import glob
+import argparse
 import gc
+import glob
+import os
+import re
 
-# ================= 配置区域 =================
-DATA_FOLDER_PATH = "D:/研究/1-大论文/数据集/TEG6105BEV13_LFP604/data/"
+import pandas as pd
+
+# ================= 默认配置（可被命令行覆盖） =================
+DATA_FOLDER_PATH = "data"
 PROCESSED_FILE_PATH = "Processed_All_Bus_Data.csv"
-# 注意路径里的斜杠最好用正斜杠 / 或者在字符串前加 r
-SOH_MAPPING_FILE = "D:/研究/1-大论文/数据集/第三章/SOH_Predictions_For_SOC.csv"
+SOH_MAPPING_FILE = "outputs_final_best/SOH_Predictions_For_SOC.csv"
 
 USE_COLS = ['DATA_TIME', 'totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC']
-MIN_VALID_VOLTAGE = 100.0 
-GAP_THRESHOLD_SEC = 1800 
+MIN_VALID_VOLTAGE = 100.0
+GAP_THRESHOLD_SEC = 1800
 SOH_BASE_DATE = "2020-01-01"
 INITIAL_SOH_POLICY = "drop_until_first_valid"  # "drop_until_first_valid" 或 "fill_default"
 DEFAULT_INITIAL_SOH = 1.0
-# ===========================================
+# ===========================================================
 
 
-def _prepare_soh_trajectory(soh_mapping_df, veh_name):
+def _normalize_vehicle_key(name):
+    if not isinstance(name, str):
+        return ""
+    s = name.strip()
+    m = re.search(r'(EV\d+)', s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return s.upper()
+
+
+def _resolve_vehicle_rows(soh_mapping_df, veh_name):
+    """支持 Vehicle 命名不一致（如 LFP604EV1 vs TEG...EV1sample）的稳健匹配。"""
+    direct = soh_mapping_df[soh_mapping_df['Vehicle'] == veh_name].copy()
+    if len(direct) > 0:
+        return direct
+
+    target_key = _normalize_vehicle_key(veh_name)
+    if not target_key:
+        return direct
+
+    tmp = soh_mapping_df.copy()
+    tmp['_veh_key'] = tmp['Vehicle'].astype(str).map(_normalize_vehicle_key)
+    fuzzy = tmp[tmp['_veh_key'] == target_key].copy()
+    if len(fuzzy) > 0:
+        print(f"    ℹ️ 车辆名映射: {veh_name} -> key={target_key}，匹配到 {fuzzy['Vehicle'].iloc[0]}")
+    return fuzzy
+
+
+def _prepare_soh_trajectory(soh_mapping_df, veh_name, soh_base_date):
     """
     统一整理某辆车 SOH 时间轨迹，供 merge_asof(direction='backward') 前向保持使用。
     优先读取真实时间戳；若只有 Days 列，则退化为基准日+天数。
     """
-    veh_soh = soh_mapping_df[soh_mapping_df['Vehicle'] == veh_name].copy()
+    veh_soh = _resolve_vehicle_rows(soh_mapping_df, veh_name)
     if len(veh_soh) == 0:
         return veh_soh
 
@@ -47,8 +76,7 @@ def _prepare_soh_trajectory(soh_mapping_df, veh_name):
     elif 'Timestamp' in veh_soh.columns:
         veh_soh['SOH_TIME'] = pd.to_datetime(veh_soh['Timestamp'], errors='coerce')
     elif 'Days' in veh_soh.columns:
-        # 兼容仅有“天级索引”的映射文件
-        veh_soh['SOH_TIME'] = pd.to_datetime(SOH_BASE_DATE) + pd.to_timedelta(veh_soh['Days'], unit='D')
+        veh_soh['SOH_TIME'] = pd.to_datetime(soh_base_date) + pd.to_timedelta(veh_soh['Days'], unit='D')
     else:
         raise KeyError("SOH 映射表缺少可用于时间对齐的列（Charge_End_Time/DATA_TIME/Timestamp/Days）。")
 
@@ -56,50 +84,53 @@ def _prepare_soh_trajectory(soh_mapping_df, veh_name):
     veh_soh = veh_soh.sort_values('SOH_TIME')
     return veh_soh[['SOH_TIME', 'Pred_SOH']]
 
-def process_integrated():
-    csv_files = glob.glob(os.path.join(DATA_FOLDER_PATH, "*.csv"))
+
+def process_integrated(args):
+    csv_files = sorted(glob.glob(os.path.join(args.data_folder, "*.csv")))
     print(f"📂 找到 {len(csv_files)} 个高频运行文件，启动【宏微观联合特征对齐】...")
 
-    if os.path.exists(PROCESSED_FILE_PATH): os.remove(PROCESSED_FILE_PATH)
-    
-    # 1. 加载第三章的 SOH 预测结果
-    if not os.path.exists(SOH_MAPPING_FILE):
-        raise FileNotFoundError(f"找不到 {SOH_MAPPING_FILE}！请先运行 soh_eval.py 导出 SOH 数据。")
-    soh_mapping = pd.read_csv(SOH_MAPPING_FILE)
-    
-    global_cycle_offset = 0 
-    
+    if len(csv_files) == 0:
+        raise FileNotFoundError(f"数据目录下未找到 CSV: {args.data_folder}")
+
+    if os.path.exists(args.output_csv):
+        os.remove(args.output_csv)
+
+    if not os.path.exists(args.soh_mapping):
+        raise FileNotFoundError(f"找不到 SOH 映射文件: {args.soh_mapping}")
+    soh_mapping = pd.read_csv(args.soh_mapping)
+
+    if 'Vehicle' not in soh_mapping.columns:
+        raise KeyError("SOH 映射文件缺少 Vehicle 列。")
+
+    global_cycle_offset = 0
+
     for i, file_path in enumerate(csv_files):
         file_name = os.path.basename(file_path)
-        veh_name = file_name.split('.')[0] # 获取如 TEG6105BEV13_LFP604EV0sample
+        veh_name = file_name.split('.')[0]
         print(f"\n>>> [{i+1}/{len(csv_files)}] 正在处理: {veh_name}")
 
         try:
-            # 读取高频微观数据
-            try: df = pd.read_csv(file_path, encoding='gbk', usecols=USE_COLS, low_memory=False)
-            except: df = pd.read_csv(file_path, encoding='utf-8', usecols=USE_COLS, low_memory=False)
-            
+            try:
+                df = pd.read_csv(file_path, encoding='gbk', usecols=USE_COLS, low_memory=False)
+            except Exception:
+                df = pd.read_csv(file_path, encoding='utf-8', usecols=USE_COLS, low_memory=False)
+
             for col in ['totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-            df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'])
-            df = df.dropna(subset=['totalVoltage'])
-            df = df[df['totalVoltage'] > MIN_VALID_VOLTAGE].copy()
-            df = df.sort_values('DATA_TIME').reset_index(drop=True)
-            if len(df) == 0: continue
 
-            # 划分行程
+            df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'], errors='coerce')
+            df = df.dropna(subset=['DATA_TIME', 'totalVoltage'])
+            df = df[df['totalVoltage'] > args.min_valid_voltage].copy()
+            df = df.sort_values('DATA_TIME').reset_index(drop=True)
+            if len(df) == 0:
+                continue
+
             df['time_diff'] = df['DATA_TIME'].diff().dt.total_seconds().fillna(0)
-            internal_cycle_ids = (df['time_diff'] > GAP_THRESHOLD_SEC).astype(int).cumsum() + 1
+            internal_cycle_ids = (df['time_diff'] > args.gap_threshold_sec).astype(int).cumsum() + 1
             df['Cycle_ID'] = internal_cycle_ids + global_cycle_offset
             global_cycle_offset = df['Cycle_ID'].max()
 
-            # ================= ⚡️ 核心合龙逻辑：SOH 前向保持（零阶保持）⚡️ =================
-            # 用“最近一次完成充电计算出的 SOH”对后续放电高频数据做方向为 backward 的时间对齐，
-            # 从而严格满足在线因果性，避免未来 SOH 泄露。
-            df = df.sort_values('DATA_TIME').reset_index(drop=True)
-            veh_soh_trajectory = _prepare_soh_trajectory(soh_mapping, veh_name)
-
+            veh_soh_trajectory = _prepare_soh_trajectory(soh_mapping, veh_name, args.soh_base_date)
             if len(veh_soh_trajectory) > 0:
                 df = pd.merge_asof(
                     df,
@@ -111,12 +142,12 @@ def process_integrated():
                 )
                 df['SOH'] = df['Pred_SOH']
 
-                if INITIAL_SOH_POLICY == 'fill_default':
-                    df['SOH'] = df['SOH'].fillna(DEFAULT_INITIAL_SOH)
-                elif INITIAL_SOH_POLICY == 'drop_until_first_valid':
+                if args.initial_soh_policy == 'fill_default':
+                    df['SOH'] = df['SOH'].fillna(args.default_initial_soh)
+                elif args.initial_soh_policy == 'drop_until_first_valid':
                     df = df[df['SOH'].notna()].copy()
                 else:
-                    raise ValueError(f"未知 INITIAL_SOH_POLICY: {INITIAL_SOH_POLICY}")
+                    raise ValueError(f"未知 initial_soh_policy: {args.initial_soh_policy}")
 
                 if len(df) == 0:
                     print("    ⚠️ 当前文件所有数据都早于首个有效 SOH 更新点，已跳过。")
@@ -124,28 +155,48 @@ def process_integrated():
 
                 print(f"    ✅ 已按前向保持注入 SOH（backward asof），SOH 范围: {df['SOH'].min():.3f} ~ {df['SOH'].max():.3f}")
             else:
-                df['SOH'] = DEFAULT_INITIAL_SOH
-                print(f"    ⚠️ 映射表中无该车有效 SOH 轨迹，已默认填充 SOH={DEFAULT_INITIAL_SOH:.3f}")
-            # ======================================================================================
+                df['SOH'] = args.default_initial_soh
+                print(f"    ⚠️ 无该车 SOH 轨迹，已默认填充 SOH={args.default_initial_soh:.3f}")
 
             temp_mean = ((df['maxTemperature'] + df['minTemperature']) / 2).ffill()
             final_df = pd.DataFrame({
-                'Current': df['totalCurrent'],  
+                'Current': df['totalCurrent'],
                 'Voltage': df['totalVoltage'],
                 'Temperature': temp_mean,
                 'SOC': df['SOC'],
-                'Cycle_ID': df['Cycle_ID'], 
-                'SOH': df['SOH']  # 此时的 SOH 已经是具有高度物理意义的预测值了！
+                'Cycle_ID': df['Cycle_ID'],
+                'SOH': df['SOH'],
             }).astype('float32')
 
             write_header = (i == 0)
-            final_df.to_csv(PROCESSED_FILE_PATH, mode='a', index=False, header=write_header)
-            
-            del df; del final_df; gc.collect()
+            final_df.to_csv(args.output_csv, mode='a', index=False, header=write_header)
+
+            del df
+            del final_df
+            gc.collect()
         except Exception as e:
             print(f"    ❌ 处理出错: {e}")
 
-    print(f"\n🎉 宏微观数据合龙完成！联合数据集位于: {PROCESSED_FILE_PATH}")
+    print(f"\n🎉 宏微观数据合龙完成！联合数据集位于: {args.output_csv}")
+
+
+def build_args():
+    parser = argparse.ArgumentParser(description="构建 SOC 训练数据：将 SOH 前向保持注入动态工况数据")
+    parser.add_argument('--data-folder', default=DATA_FOLDER_PATH, help='实车高频数据目录（按车 CSV）')
+    parser.add_argument('--soh-mapping', default=SOH_MAPPING_FILE, help='SOH 估计结果 CSV 路径')
+    parser.add_argument('--output-csv', default=PROCESSED_FILE_PATH, help='输出联合训练集 CSV 路径')
+    parser.add_argument('--min-valid-voltage', type=float, default=MIN_VALID_VOLTAGE, help='最小有效总压阈值')
+    parser.add_argument('--gap-threshold-sec', type=float, default=GAP_THRESHOLD_SEC, help='行程切分时间间隔阈值（秒）')
+    parser.add_argument('--soh-base-date', default=SOH_BASE_DATE, help='当 SOH 文件仅有 Days 列时使用的基准日期')
+    parser.add_argument(
+        '--initial-soh-policy',
+        default=INITIAL_SOH_POLICY,
+        choices=['drop_until_first_valid', 'fill_default'],
+        help='首个有效 SOH 更新前数据处理策略',
+    )
+    parser.add_argument('--default-initial-soh', type=float, default=DEFAULT_INITIAL_SOH, help='默认 SOH 值')
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    process_integrated()
+    process_integrated(build_args())

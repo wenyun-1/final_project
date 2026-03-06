@@ -118,3 +118,107 @@ python run_best_soh_experiment.py --search-root outputs_search --final-output ou
 - `outputs_final_best/best_config.txt`
 - `outputs_final_best/top6_vehicle_alias.csv`
 - `figures/chapter3_top6_soh.png`
+
+## 第四章 SOC 估计：从 SOH 结果到最终 SOC 输出（可直接运行）
+
+你说得非常对，之前版本没有把 SOC 运行链路写清楚。下面是完整三步。
+
+### 0) 先确认你有 SOH 结果文件
+推荐使用：
+- `outputs_final/SOH_Predictions_For_SOC.csv`
+
+该文件至少要有：
+- `Vehicle`（车辆名，如 `TEG6105BEV13_LFP604EV0sample`）
+- `Pred_SOH`（SOH 值，0~1）
+- 时间定位列之一：`Charge_End_Time` / `DATA_TIME` / `Timestamp` / `Days`
+
+> SOC 数据处理脚本会自动识别上述时间列，并按“最近一次有效 SOH 前向保持（ZOH）”注入放电数据。
+
+### 1) 生成 SOC 训练数据（动态工况 + SOH 因果注入）
+
+```bash
+python SOC_DataProcess_Real_Batch.py \
+  --data-folder data \
+  --soh-mapping outputs_final/SOH_Predictions_For_SOC.csv \
+  --output-csv Processed_All_Bus_Data.csv \
+  --initial-soh-policy drop_until_first_valid
+```
+
+说明：
+- `drop_until_first_valid`：首个有效 SOH 出现前的数据会丢弃（更严谨，避免引入默认值偏差）。
+- 如果你希望保留全部数据，可改为 `--initial-soh-policy fill_default --default-initial-soh 1.0`。
+
+### 2) 训练 SOC 模型（Attention-GRU + SOH 门控）
+
+```bash
+python SOC_Train_Gated.py \
+  --file-path Processed_All_Bus_Data.csv \
+  --epochs 20 \
+  --window-size 30 \
+  --sample-stride 10 \
+  --model-out Best_SOH_Model.pth
+```
+
+### 3) 进行 SOC 对比验证并输出图
+
+```bash
+python SOC_Test_Innovation.py \
+  --test-file-path data/TEG6105BEV13_LFP604EV8sample.csv \
+  --soh-mapping-file outputs_final/SOH_Predictions_For_SOC.csv \
+  --model-path Best_SOH_Model.pth \
+  --figure-out Macro_Micro_Coestimation_Result.png
+```
+
+输出：
+- 终端打印 `Ours(有SOH)` vs `Baseline(无SOH)` 的 MAE
+- 图像 `Macro_Micro_Coestimation_Result.png`
+
+### 常见报错排查
+
+- **找不到 SOH 文件**：检查 `--soh-mapping` 或 `--soh-mapping-file` 路径。
+- **SOH 文件无时间列**：请确保至少有 `Charge_End_Time` / `DATA_TIME` / `Timestamp` / `Days` 之一。
+- **测试片段长度不足**：在 `SOC_Test_Innovation.py` 中调整 `--segment-start` 和 `--segment-end`。
+
+## 第四章 SOC 最终版（默认直接使用 outputs_final_best）
+
+你当前的数据结构 `Vehicle,Days,Pred_SOH` 已兼容，且默认读取：
+- `outputs_final_best/SOH_Predictions_For_SOC.csv`
+
+同时已兼容车辆名不一致场景（例如 SOH 文件中是 `LFP604EV1`，原始实车文件名是 `TEG6105BEV13_LFP604EV1sample.csv`）。
+
+### 一键执行（推荐）
+
+```bash
+python SOC_Run_End2End.py \
+  --data-folder data \
+  --soh-mapping outputs_final_best/SOH_Predictions_For_SOC.csv \
+  --epochs 20
+```
+
+执行完成后可直接看到：
+- `Processed_All_Bus_Data.csv`（SOC 训练集）
+- `Best_SOH_Model.pth`（SOC 最优模型）
+- `Macro_Micro_Coestimation_Result.png`（最终对比图，含有/无 SOH 的 SOC 估计效果）
+
+### 分步执行（若你想单独控制每步）
+
+```bash
+python SOC_DataProcess_Real_Batch.py \
+  --data-folder data \
+  --soh-mapping outputs_final_best/SOH_Predictions_For_SOC.csv \
+  --output-csv Processed_All_Bus_Data.csv \
+  --initial-soh-policy drop_until_first_valid
+
+python SOC_Train_Gated.py \
+  --file-path Processed_All_Bus_Data.csv \
+  --epochs 20 \
+  --window-size 30 \
+  --sample-stride 10 \
+  --model-out Best_SOH_Model.pth
+
+python SOC_Test_Innovation.py \
+  --test-file-path data/TEG6105BEV13_LFP604EV8sample.csv \
+  --soh-mapping-file outputs_final_best/SOH_Predictions_For_SOC.csv \
+  --model-path Best_SOH_Model.pth \
+  --figure-out Macro_Micro_Coestimation_Result.png
+```
