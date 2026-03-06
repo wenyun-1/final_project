@@ -1,0 +1,3 @@
+best_smooth_window=17
+best_seed=42
+criterion=minimum RMSE_filtered_mean on expanded search

@@ -1,0 +1,5 @@
+Raw = 模型对单个样本的直接输出（不做时序平滑）
+Filtered = 对Raw做滑动窗口平滑后的输出（用于SOH最终展示与SOC输入）
+本消融仅比较 smooth_window 和 seed 对指标的影响。
+推荐最终SOH使用: sw15_seed3407
+选择准则: RMSE_filtered_mean 最小。
