@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import re
 
@@ -8,6 +9,26 @@ import pandas as pd
 import torch
 
 from SOC_AttentionGRU_Gated import SOH_Gated_GRU
+
+
+def _resolve_test_file(args):
+    """兼容“直接运行脚本不传 --test-file-path”的场景。"""
+    if args.test_file_path:
+        if not os.path.exists(args.test_file_path):
+            raise FileNotFoundError(f"测试文件不存在: {args.test_file_path}")
+        return args.test_file_path
+
+    # 优先选 EV8（默认演示车），否则回退到 data 目录最后一个 csv
+    preferred = sorted(glob.glob(os.path.join(args.data_folder, "*EV8*.csv")))
+    if preferred:
+        return preferred[0]
+
+    candidates = sorted(glob.glob(os.path.join(args.data_folder, "*.csv")))
+    if not candidates:
+        raise FileNotFoundError(
+            f"未找到测试车辆 CSV，请传 --test-file-path，或检查 --data-folder={args.data_folder}"
+        )
+    return candidates[-1]
 
 
 def _normalize_vehicle_key(name):
@@ -68,14 +89,16 @@ def _attach_soh(test_segment, soh_mapping, veh_name, soh_base_date, default_soh)
 
 def run_integrated_test(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    veh_name = os.path.basename(args.test_file_path).split('.')[0]
+    test_file_path = _resolve_test_file(args)
+    veh_name = os.path.basename(test_file_path).split('.')[0]
+    print(f"   -> 实际使用测试文件: {test_file_path}")
     print(f"1. 正在加载测试车辆: {veh_name} ...")
 
     target_cols = ['totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC', 'DATA_TIME']
     try:
-        df = pd.read_csv(args.test_file_path, encoding='gbk', usecols=target_cols)
+        df = pd.read_csv(test_file_path, encoding='gbk', usecols=target_cols)
     except Exception:
-        df = pd.read_csv(args.test_file_path, encoding='utf-8', usecols=target_cols)
+        df = pd.read_csv(test_file_path, encoding='utf-8', usecols=target_cols)
 
     df['totalVoltage'] = pd.to_numeric(df['totalVoltage'], errors='coerce')
     df = df.dropna(subset=['totalVoltage'])
@@ -153,7 +176,8 @@ def run_integrated_test(args):
 
 def build_args():
     parser = argparse.ArgumentParser(description='SOC 创新对比测试（有/无 SOH 门控）')
-    parser.add_argument('--test-file-path', required=True, help='单车原始高频 CSV 路径')
+    parser.add_argument('--test-file-path', default='', help='单车原始高频 CSV 路径；不填则自动从 data 目录选择')
+    parser.add_argument('--data-folder', default='data', help='自动选择测试文件时使用的数据目录')
     parser.add_argument('--soh-mapping-file', default='outputs_final_best/SOH_Predictions_For_SOC.csv', help='SOH 估计结果 CSV')
     parser.add_argument('--model-path', default='Best_SOH_Model.pth', help='训练好的 SOC 模型路径')
     parser.add_argument('--window-size', type=int, default=30)

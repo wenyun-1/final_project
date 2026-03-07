@@ -222,3 +222,11 @@ python SOC_Test_Innovation.py \
   --model-path Best_SOH_Model.pth \
   --figure-out Macro_Micro_Coestimation_Result.png
 ```
+
+也支持直接运行（不传 `--test-file-path`，脚本会自动优先选择 `data/` 下包含 `EV8` 的文件，否则选最后一个 CSV）：
+
+```bash
+python SOC_Test_Innovation.py \
+  --soh-mapping-file outputs_final_best/SOH_Predictions_For_SOC.csv \
+  --model-path Best_SOH_Model.pth
+```
