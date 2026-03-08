@@ -29,7 +29,9 @@ python soh_final_pipeline.py \
   --read-chunk-size 200000 \
   --epochs 120 \
   --split-mode cross_vehicle \
-  --test-vehicle-ratio 0.3 \
+  --train-vehicle-count 10 \
+  --test-vehicle-count 2 \
+  --log-every-epoch 10 \
   --smooth-window 15 \
   --output outputs_final
 ```
@@ -37,8 +39,9 @@ python soh_final_pipeline.py \
 ### 说明
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；
-- `test-vehicle-ratio=0.3`：约 30% 车辆留作测试；
+- 默认采用 `10` 车训练 + `2` 车测试（可通过参数修改）；
 - 若内存紧张，可将 `--read-chunk-size` 调小（如 `50000` 或 `20000`）；
+- 运行中会打印 `[Load]`、`[Split]`、`[Data]`、`[Train]` 进度信息，便于确认程序未卡住；
 - 伪标签趋势拟合已加入数值稳定和退化回退机制，降低 `RankWarning` 风险。
 
 ### 主要输出

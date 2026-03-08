@@ -50,7 +50,10 @@ class Config:
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
+    train_vehicle_count: int = 10
+    test_vehicle_count: int = 2
     read_chunk_size: int = 200000
+    log_every_epoch: int = 10
 
 
 def set_seed(seed: int) -> None:
@@ -242,10 +245,21 @@ def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tupl
     rng = random.Random(cfg.seed)
     shuffled = vehicles[:]
     rng.shuffle(shuffled)
-    n_test = max(1, int(len(shuffled) * cfg.test_vehicle_ratio))
-    n_test = min(len(shuffled) - 1, n_test)
+    if cfg.test_vehicle_count > 0:
+        n_test = min(len(shuffled) - 1, cfg.test_vehicle_count)
+    else:
+        n_test = max(1, int(len(shuffled) * cfg.test_vehicle_ratio))
+        n_test = min(len(shuffled) - 1, n_test)
+
+    if cfg.train_vehicle_count > 0:
+        max_test_by_train = max(1, len(shuffled) - cfg.train_vehicle_count)
+        n_test = min(n_test, max_test_by_train)
+
     test_vehicles = sorted(shuffled[:n_test])
-    train_vehicles = sorted([v for v in shuffled if v not in set(test_vehicles)])
+    remain = [v for v in shuffled if v not in set(test_vehicles)]
+    if cfg.train_vehicle_count > 0:
+        remain = remain[: cfg.train_vehicle_count]
+    train_vehicles = sorted(remain)
     return train_vehicles, test_vehicles
 
 
@@ -320,12 +334,15 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
     train_ds = SOHDataset(train_rows, mean=mean, std=std)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    print(f"[Data] 训练样本数: {len(train_rows)} | 测试样本数: {len(test_rows)}")
 
     model = PIUAE().to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
     mse = nn.MSELoss()
-    for _ in range(cfg.epochs):
+    for epoch in range(cfg.epochs):
         model.train()
+        train_loss_sum = 0.0
+        train_steps = 0
         for c_fp, c_sc, p_fp, p_sc, y, _, _ in train_loader:
             c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
             y_pred, recon = model(c_fp, c_sc)
@@ -334,6 +351,12 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            train_loss_sum += float(loss.item())
+            train_steps += 1
+
+        if (epoch + 1) % max(1, cfg.log_every_epoch) == 0 or epoch == 0 or (epoch + 1) == cfg.epochs:
+            avg_loss = train_loss_sum / max(1, train_steps)
+            print(f"[Train] Epoch {epoch+1}/{cfg.epochs} | AvgLoss={avg_loss:.6f}")
 
     torch.save(model.state_dict(), os.path.join(output_dir, "global_pi_uae.pth"))
 
@@ -407,13 +430,14 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
 def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict[str, pd.DataFrame]:
     seg_by_vehicle: Dict[str, List[Dict]] = {}
-    for f in files:
+    for i, f in enumerate(files, 1):
         veh_file = os.path.splitext(os.path.basename(f))[0]
         veh = normalize_vehicle_name(veh_file)
         try:
             segs = extract_segments_from_file(f, cfg)
             if len(segs) > 0:
                 seg_by_vehicle.setdefault(veh, []).extend(segs)
+            print(f"[Load] {i}/{len(files)} {veh_file} -> 片段数 {len(segs)}")
         except Exception as e:
             print(f"[WARN] {veh_file} 处理失败: {e}")
 
@@ -437,8 +461,11 @@ def main() -> None:
     parser.add_argument("--smooth-window", type=int, default=15)
     parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
     parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
+    parser.add_argument("--train-vehicle-count", type=int, default=10, help="跨车训练车辆数（<=0 表示不限制）")
+    parser.add_argument("--test-vehicle-count", type=int, default=2, help="跨车测试车辆数（<=0 表示按比例）")
     parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
     parser.add_argument("--read-chunk-size", type=int, default=200000, help="分块读取行数，内存不足时可调小")
+    parser.add_argument("--log-every-epoch", type=int, default=10, help="每隔多少个epoch打印训练进度")
     args = parser.parse_args()
 
     cfg = Config(
@@ -447,7 +474,10 @@ def main() -> None:
         smooth_window=args.smooth_window,
         split_mode=args.split_mode,
         test_vehicle_ratio=args.test_vehicle_ratio,
+        train_vehicle_count=args.train_vehicle_count,
+        test_vehicle_count=args.test_vehicle_count,
         read_chunk_size=args.read_chunk_size,
+        log_every_epoch=args.log_every_epoch,
     )
     set_seed(cfg.seed)
 
