@@ -26,6 +26,7 @@
 ```bash
 python soh_final_pipeline.py \
   --data-dirs data data1 \
+  --read-chunk-size 200000 \
   --epochs 120 \
   --split-mode cross_vehicle \
   --test-vehicle-ratio 0.3 \
@@ -37,6 +38,7 @@ python soh_final_pipeline.py \
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；
 - `test-vehicle-ratio=0.3`：约 30% 车辆留作测试；
+- 若内存紧张，可将 `--read-chunk-size` 调小（如 `50000` 或 `20000`）；
 - 伪标签趋势拟合已加入数值稳定和退化回退机制，降低 `RankWarning` 风险。
 
 ### 主要输出

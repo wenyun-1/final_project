@@ -50,6 +50,7 @@ class Config:
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
+    read_chunk_size: int = 200000
 
 
 def set_seed(seed: int) -> None:
@@ -74,76 +75,93 @@ def normalize_vehicle_name(file_stem: str) -> str:
     return name
 
 
-def read_vehicle_csv(path: str) -> pd.DataFrame:
+def _extract_from_one_segment(records: List[Dict], cfg: Config) -> Dict | None:
+    if len(records) <= cfg.min_seg_points:
+        return None
+
+    df_seg = pd.DataFrame(records)
+    if df_seg["totalVoltage"].min() >= V_START or df_seg["totalVoltage"].max() <= V_END:
+        return None
+
+    idx_s = (df_seg["totalVoltage"] - V_START).abs().idxmin()
+    idx_e = (df_seg["totalVoltage"] - V_END).abs().idxmin()
+    if idx_e <= idx_s:
+        return None
+
+    df_sub = df_seg.loc[idx_s:idx_e].copy()
+    if len(df_sub) <= 10:
+        return None
+
+    dt = df_sub["DATA_TIME"].diff().dt.total_seconds().fillna(10)
+    if dt.max() > cfg.max_gap_seconds:
+        return None
+
+    soc_delta = df_seg["SOC"].iloc[-1] - df_seg["SOC"].iloc[0]
+    if soc_delta <= cfg.min_soc_delta:
+        return None
+
+    curr_abs = df_seg["totalCurrent"].abs()
+    ah = (curr_abs * df_seg["DATA_TIME"].diff().dt.total_seconds().fillna(10)).sum() / 3600
+    raw_cap = ah / (soc_delta / 100.0)
+
+    v_seq = df_sub["totalVoltage"].values
+    f_interp = interp1d(np.linspace(0, 1, len(v_seq)), v_seq, kind="linear")
+    fingerprint = (f_interp(np.linspace(0, 1, 100)) - V_START) / (V_END - V_START)
+
+    return {
+        "days": int((df_seg["DATA_TIME"].iloc[0] - pd.Timestamp("2020-01-01")).days),
+        "raw_cap": float(raw_cap),
+        "fingerprint": fingerprint,
+        "avg_curr": float(df_sub["totalCurrent"].abs().mean()),
+        "avg_temp": float(df_sub["maxTemperature"].mean()),
+    }
+
+
+def extract_segments_from_file(path: str, cfg: Config) -> List[Dict]:
     sample = pd.read_csv(path, nrows=5)
     use_cols = ["DATA_TIME", "totalCurrent", "totalVoltage", "SOC"]
     if "maxTemperature" in sample.columns:
         use_cols.append("maxTemperature")
 
-    df = pd.read_csv(path, usecols=use_cols, low_memory=False)
-    df["DATA_TIME"] = pd.to_datetime(df["DATA_TIME"], format=TIME_FORMAT, errors="coerce")
-    for c in ["totalCurrent", "totalVoltage", "SOC"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "maxTemperature" in df.columns:
-        df["maxTemperature"] = pd.to_numeric(df["maxTemperature"], errors="coerce")
-    else:
-        df["maxTemperature"] = 25.0
-    return df.dropna().sort_values("DATA_TIME").reset_index(drop=True)
+    out: List[Dict] = []
+    curr_seg: List[Dict] = []
 
+    reader = pd.read_csv(
+        path,
+        usecols=use_cols,
+        low_memory=False,
+        chunksize=cfg.read_chunk_size,
+        on_bad_lines="skip",
+    )
+    for chunk in reader:
+        chunk["DATA_TIME"] = pd.to_datetime(chunk["DATA_TIME"], format=TIME_FORMAT, errors="coerce")
+        for c in ["totalCurrent", "totalVoltage", "SOC"]:
+            chunk[c] = pd.to_numeric(chunk[c], errors="coerce")
+        if "maxTemperature" in chunk.columns:
+            chunk["maxTemperature"] = pd.to_numeric(chunk["maxTemperature"], errors="coerce")
+        else:
+            chunk["maxTemperature"] = 25.0
+        chunk = chunk.dropna(subset=["DATA_TIME", "totalCurrent", "totalVoltage", "SOC", "maxTemperature"])
 
-def extract_segments(df: pd.DataFrame, cfg: Config) -> List[Dict]:
-    segs: List[Dict] = []
-    curr: List[Dict] = []
-    for row in df.to_dict("records"):
-        if row["totalCurrent"] < -1.0:
-            curr.append(row)
-            continue
-        if len(curr) > cfg.min_seg_points:
-            segs.append({"records": curr})
-        curr = []
-    if len(curr) > cfg.min_seg_points:
-        segs.append({"records": curr})
-
-    out = []
-    for s in segs:
-        df_seg = pd.DataFrame(s["records"])
-        if df_seg["totalVoltage"].min() >= V_START or df_seg["totalVoltage"].max() <= V_END:
-            continue
-
-        idx_s = (df_seg["totalVoltage"] - V_START).abs().idxmin()
-        idx_e = (df_seg["totalVoltage"] - V_END).abs().idxmin()
-        if idx_e <= idx_s:
-            continue
-
-        df_sub = df_seg.loc[idx_s:idx_e].copy()
-        if len(df_sub) <= 10:
-            continue
-
-        dt = df_sub["DATA_TIME"].diff().dt.total_seconds().fillna(10)
-        if dt.max() > cfg.max_gap_seconds:
-            continue
-
-        soc_delta = df_seg["SOC"].iloc[-1] - df_seg["SOC"].iloc[0]
-        if soc_delta <= cfg.min_soc_delta:
-            continue
-
-        curr_abs = df_seg["totalCurrent"].abs()
-        ah = (curr_abs * df_seg["DATA_TIME"].diff().dt.total_seconds().fillna(10)).sum() / 3600
-        raw_cap = ah / (soc_delta / 100.0)
-
-        v_seq = df_sub["totalVoltage"].values
-        f_interp = interp1d(np.linspace(0, 1, len(v_seq)), v_seq, kind="linear")
-        fingerprint = (f_interp(np.linspace(0, 1, 100)) - V_START) / (V_END - V_START)
-
-        out.append(
-            {
-                "days": int((df_seg["DATA_TIME"].iloc[0] - pd.Timestamp("2020-01-01")).days),
-                "raw_cap": float(raw_cap),
-                "fingerprint": fingerprint,
-                "avg_curr": float(df_sub["totalCurrent"].abs().mean()),
-                "avg_temp": float(df_sub["maxTemperature"].mean()),
+        for row in chunk.itertuples(index=False):
+            rec = {
+                "DATA_TIME": row.DATA_TIME,
+                "totalCurrent": float(row.totalCurrent),
+                "totalVoltage": float(row.totalVoltage),
+                "SOC": float(row.SOC),
+                "maxTemperature": float(row.maxTemperature),
             }
-        )
+            if rec["totalCurrent"] < -1.0:
+                curr_seg.append(rec)
+            else:
+                seg = _extract_from_one_segment(curr_seg, cfg)
+                if seg is not None:
+                    out.append(seg)
+                curr_seg = []
+
+    seg = _extract_from_one_segment(curr_seg, cfg)
+    if seg is not None:
+        out.append(seg)
     return out
 
 
@@ -393,8 +411,7 @@ def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict
         veh_file = os.path.splitext(os.path.basename(f))[0]
         veh = normalize_vehicle_name(veh_file)
         try:
-            df = read_vehicle_csv(f)
-            segs = extract_segments(df, cfg)
+            segs = extract_segments_from_file(f, cfg)
             if len(segs) > 0:
                 seg_by_vehicle.setdefault(veh, []).extend(segs)
         except Exception as e:
@@ -421,6 +438,7 @@ def main() -> None:
     parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
     parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
     parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
+    parser.add_argument("--read-chunk-size", type=int, default=200000, help="分块读取行数，内存不足时可调小")
     args = parser.parse_args()
 
     cfg = Config(
@@ -429,6 +447,7 @@ def main() -> None:
         smooth_window=args.smooth_window,
         split_mode=args.split_mode,
         test_vehicle_ratio=args.test_vehicle_ratio,
+        read_chunk_size=args.read_chunk_size,
     )
     set_seed(cfg.seed)
 
