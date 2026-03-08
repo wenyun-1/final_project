@@ -18,7 +18,11 @@ def train(args):
         args.file_path,
         window_size=args.window_size,
         sample_stride=args.sample_stride,
+        discharge_only=(not args.include_charge),
     )
+
+    if len(dataset) < 10:
+        raise ValueError("可用样本过少（可能过滤后为空），请检查数据或关闭放电过滤。")
 
     train_size = int(args.train_ratio * len(dataset))
     test_size = len(dataset) - train_size
@@ -93,6 +97,7 @@ def build_args():
     parser.add_argument('--sample-stride', type=int, default=10)
     parser.add_argument('--train-ratio', type=float, default=0.8)
     parser.add_argument('--soh-dropout', type=float, default=0.3, help='训练时 SOH 随机屏蔽概率')
+    parser.add_argument('--include-charge', action='store_true', help='若设置则不过滤充电段（默认仅放电段）')
     return parser.parse_args()
 
 
