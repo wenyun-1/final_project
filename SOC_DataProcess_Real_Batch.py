@@ -49,6 +49,24 @@ def _load_allowed_vehicle_keys(split_file, split_role):
     return keys
 
 
+def _load_allowed_vehicle_keys(split_file, split_role):
+    if not split_file:
+        return None
+    if not os.path.exists(split_file):
+        raise FileNotFoundError(f"找不到 vehicle_split 文件: {split_file}")
+    split_df = pd.read_csv(split_file)
+    if not {"Vehicle", "Role"}.issubset(split_df.columns):
+        raise KeyError("vehicle_split.csv 需要包含 Vehicle, Role 两列。")
+    if split_role not in {"train", "test", "all"}:
+        raise ValueError("split_role 仅支持 train/test/all")
+    if split_role == "all":
+        target = split_df.copy()
+    else:
+        target = split_df[split_df["Role"].astype(str).str.lower() == split_role].copy()
+    keys = {_normalize_vehicle_key(v) for v in target["Vehicle"].astype(str).tolist()}
+    return keys
+
+
 def _resolve_vehicle_rows(soh_mapping_df, veh_name):
     """支持 Vehicle 命名不一致（如 LFP604EV1 vs TEG...EV1sample）的稳健匹配。"""
     direct = soh_mapping_df[soh_mapping_df['Vehicle'] == veh_name].copy()
