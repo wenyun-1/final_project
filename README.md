@@ -7,17 +7,16 @@
 请把**完整数据**放在：
 
 - `data/`
-- `data1/`
 
 典型命名（示例）：
 
-- `data/TEG6105BEV13_LFP604EV0sample.csv`
-- `data1/LFP604EV1.csv`
+- `data/LFP604EV1.csv`
+- `data/LFP604EV12.csv`
 
 当前 `soh_final_pipeline.py` 已做两件关键处理：
 
-1. 默认只扫描 `data`、`data1`（不再默认读 `samples`）；
-2. 对不同命名风格做车辆归一（如 `...EV1sample` 与 `LFP604EV1`），并按“同一车辆”合并片段，避免同车跨训练/测试集合泄漏。
+1. 默认只扫描 `data`（不再默认读 `samples`）；
+2. 统一命名为 `LFP604EV*.csv` 后，车辆匹配和 SOH→SOC 对齐流程会更稳定。
 
 ---
 
@@ -25,7 +24,7 @@
 
 ```bash
 python soh_final_pipeline.py \
-  --data-dirs data data1 \
+  --data-dirs data \
   --read-chunk-size 200000 \
   --epochs 120 \
   --split-mode cross_vehicle \
@@ -85,7 +84,7 @@ python SOC_Train_Gated.py \
   --model-out Best_SOH_Model.pth
 
 python SOC_Test_Innovation.py \
-  --test-file-path data/TEG6105BEV13_LFP604EV8sample.csv \
+  --test-file-path data/LFP604EV8.csv \
   --soh-mapping-file outputs_final/SOH_Predictions_For_SOC.csv \
   --model-path Best_SOH_Model.pth \
   --figure-out Macro_Micro_Coestimation_Result.png

@@ -15,14 +15,11 @@ def run_cmd(cmd):
 def _normalize_vehicle_key(name):
     if not isinstance(name, str):
         return ""
-    s = name.strip()
-    m = re.search(r'LFP\d+(EV\d+)', s, flags=re.IGNORECASE)
-    if not m:
-        hits = re.findall(r'(EV\d+)', s, flags=re.IGNORECASE)
-        m = re.match(r'(EV\d+)', hits[-1], flags=re.IGNORECASE) if hits else None
+    s = name.strip().upper()
+    m = re.search(r'(LFP\d+EV\d+)', s, flags=re.IGNORECASE)
     if m:
-        return f"LFP604{m.group(1).upper()}"
-    return s.upper()
+        return m.group(1).upper()
+    return s
 
 
 def pick_test_file(data_folder, preferred, split_file):

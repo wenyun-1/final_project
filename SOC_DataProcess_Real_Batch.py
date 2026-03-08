@@ -24,14 +24,29 @@ VEHICLE_SPLIT_FILE = "outputs_final/vehicle_split.csv"
 def _normalize_vehicle_key(name):
     if not isinstance(name, str):
         return ""
-    s = name.strip()
-    m = re.search(r'LFP\d+(EV\d+)', s, flags=re.IGNORECASE)
-    if not m:
-        hits = re.findall(r'(EV\d+)', s, flags=re.IGNORECASE)
-        m = re.match(r'(EV\d+)', hits[-1], flags=re.IGNORECASE) if hits else None
+    s = name.strip().upper()
+    m = re.search(r'(LFP\d+EV\d+)', s, flags=re.IGNORECASE)
     if m:
-        return f"LFP604{m.group(1).upper()}"
-    return s.upper()
+        return m.group(1).upper()
+    return s
+
+
+def _load_allowed_vehicle_keys(split_file, split_role):
+    if not split_file:
+        return None
+    if not os.path.exists(split_file):
+        raise FileNotFoundError(f"找不到 vehicle_split 文件: {split_file}")
+    split_df = pd.read_csv(split_file)
+    if not {"Vehicle", "Role"}.issubset(split_df.columns):
+        raise KeyError("vehicle_split.csv 需要包含 Vehicle, Role 两列。")
+    if split_role not in {"train", "test", "all"}:
+        raise ValueError("split_role 仅支持 train/test/all")
+    if split_role == "all":
+        target = split_df.copy()
+    else:
+        target = split_df[split_df["Role"].astype(str).str.lower() == split_role].copy()
+    keys = {_normalize_vehicle_key(v) for v in target["Vehicle"].astype(str).tolist()}
+    return keys
 
 
 def _load_allowed_vehicle_keys(split_file, split_role):

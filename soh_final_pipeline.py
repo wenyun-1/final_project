@@ -27,7 +27,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from torch.utils.data import DataLoader, Dataset
 
 TIME_FORMAT = "mixed"
-DATA_DIRS = ["data", "data1"]
+DATA_DIRS = ["data"]
 DEFAULT_OUTPUT_DIR = "outputs_final"
 
 # 电压窗口建议选在相对稳定恒流区，可按车型调参
@@ -70,15 +70,11 @@ def collect_files(data_dirs: List[str]) -> List[str]:
 
 
 def normalize_vehicle_name(file_stem: str) -> str:
-    """将不同命名风格归一到同一车辆键，避免同车跨集合泄漏。"""
-    name = file_stem.strip()
-    m = re.search(r"LFP\d+(EV\d+)", name, flags=re.IGNORECASE)
-    if not m:
-        # 回退：取最后一个 EVx，避免误匹配到如 TEG6105BEV13 的平台编号
-        hits = re.findall(r"(EV\d+)", name, flags=re.IGNORECASE)
-        m = re.match(r"(EV\d+)", hits[-1], flags=re.IGNORECASE) if hits else None
+    """统一命名场景下的车辆键提取：优先使用 LFPxxxxEVx。"""
+    name = file_stem.strip().upper()
+    m = re.search(r"(LFP\d+EV\d+)", name)
     if m:
-        return f"LFP604{m.group(1).upper()}"
+        return m.group(1)
     return name
 
 
