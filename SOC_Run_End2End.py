@@ -1,7 +1,10 @@
 import argparse
 import glob
 import os
+import re
 import subprocess
+
+import pandas as pd
 
 
 def run_cmd(cmd):
@@ -9,9 +12,31 @@ def run_cmd(cmd):
     subprocess.run(cmd, check=True)
 
 
-def pick_test_file(data_folder, preferred):
+def _normalize_vehicle_key(name):
+    if not isinstance(name, str):
+        return ""
+    s = name.strip()
+    m = re.search(r'LFP\d+(EV\d+)', s, flags=re.IGNORECASE)
+    if not m:
+        hits = re.findall(r'(EV\d+)', s, flags=re.IGNORECASE)
+        m = re.match(r'(EV\d+)', hits[-1], flags=re.IGNORECASE) if hits else None
+    if m:
+        return f"LFP604{m.group(1).upper()}"
+    return s.upper()
+
+
+def pick_test_file(data_folder, preferred, split_file):
     if preferred and os.path.exists(preferred):
         return preferred
+    if split_file and os.path.exists(split_file):
+        split_df = pd.read_csv(split_file)
+        test_veh = split_df[split_df['Role'].astype(str).str.lower() == 'test']['Vehicle'].astype(str).tolist()
+        if test_veh:
+            keys = {_normalize_vehicle_key(v) for v in test_veh}
+            for p in sorted(glob.glob(os.path.join(data_folder, "*.csv"))):
+                stem = os.path.splitext(os.path.basename(p))[0]
+                if _normalize_vehicle_key(stem) in keys:
+                    return p
     candidates = sorted(glob.glob(os.path.join(data_folder, "*.csv")))
     if not candidates:
         raise FileNotFoundError(f"数据目录下未找到 CSV: {data_folder}")
@@ -19,7 +44,7 @@ def pick_test_file(data_folder, preferred):
 
 
 def main(args):
-    test_file = pick_test_file(args.data_folder, args.test_file)
+    test_file = pick_test_file(args.data_folder, args.test_file, args.vehicle_split_file)
     print(f"📌 测试车辆文件: {test_file}")
 
     run_cmd([
@@ -29,6 +54,8 @@ def main(args):
         "--output-csv", args.processed_csv,
         "--initial-soh-policy", args.initial_soh_policy,
         "--default-initial-soh", str(args.default_initial_soh),
+        "--vehicle-split-file", args.vehicle_split_file,
+        "--split-role", "train",
     ])
 
     run_cmd([
@@ -64,6 +91,7 @@ def build_args():
     parser.add_argument('--model-out', default='Best_SOH_Model.pth', help='SOC 最佳模型输出')
     parser.add_argument('--figure-out', default='Macro_Micro_Coestimation_Result.png', help='SOC 对比图输出')
     parser.add_argument('--test-file', default='', help='指定测试车辆 CSV；留空则自动选 data/ 下最后一个')
+    parser.add_argument('--vehicle-split-file', default='outputs_final/vehicle_split.csv', help='SOH阶段输出的车辆划分文件')
     parser.add_argument('--initial-soh-policy', default='drop_until_first_valid', choices=['drop_until_first_valid', 'fill_default'])
     parser.add_argument('--default-initial-soh', type=float, default=1.0)
     parser.add_argument('--epochs', type=int, default=20)
