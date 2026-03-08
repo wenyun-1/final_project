@@ -77,6 +77,7 @@ python SOC_DataProcess_Real_Batch.py \
   --output-csv Processed_All_Bus_Data.csv \
   --vehicle-split-file outputs_final/vehicle_split.csv \
   --split-role train \
+  --read-chunk-size 200000 \
   --initial-soh-policy drop_until_first_valid
 
 python SOC_Train_Gated.py \

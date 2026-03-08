@@ -445,8 +445,11 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
                   [{"Vehicle": v, "Role": "test"} for v in test_vehicles])
     pd.DataFrame(split_rows).to_csv(os.path.join(output_dir, "vehicle_split.csv"), index=False)
 
-    for veh in test_vehicles:
-        veh_rows = [r for r in test_rows if r["Vehicle"] == veh]
+    eval_vehicles = sorted(vehicle_frames.keys())
+    test_set = set(test_vehicles)
+
+    for veh in eval_vehicles:
+        veh_rows = build_rows_for_vehicles(vehicle_frames, [veh])
         if len(veh_rows) < 5:
             continue
         test_ds = SOHDataset(veh_rows, mean=mean, std=std)
@@ -467,17 +470,18 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         y_pred = np.array(y_pred)[idx]
         y_pred_filtered = pd.Series(y_pred).rolling(window=cfg.smooth_window, min_periods=1, center=True).mean().values
 
-        metrics = {
-            "Vehicle": veh,
-            "N_test": len(y_true),
-            "RMSE_raw": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-            "MAE_raw": float(mean_absolute_error(y_true, y_pred)),
-            "R2_raw": float(r2_score(y_true, y_pred)),
-            "RMSE_filtered": float(np.sqrt(mean_squared_error(y_true, y_pred_filtered))),
-            "MAE_filtered": float(mean_absolute_error(y_true, y_pred_filtered)),
-            "R2_filtered": float(r2_score(y_true, y_pred_filtered)),
-        }
-        all_metrics.append(metrics)
+        if veh in test_set:
+            metrics = {
+                "Vehicle": veh,
+                "N_test": len(y_true),
+                "RMSE_raw": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                "MAE_raw": float(mean_absolute_error(y_true, y_pred)),
+                "R2_raw": float(r2_score(y_true, y_pred)),
+                "RMSE_filtered": float(np.sqrt(mean_squared_error(y_true, y_pred_filtered))),
+                "MAE_filtered": float(mean_absolute_error(y_true, y_pred_filtered)),
+                "R2_filtered": float(r2_score(y_true, y_pred_filtered)),
+            }
+            all_metrics.append(metrics)
 
         for d, yt, yr, yf in zip(days, y_true, y_pred, y_pred_filtered):
             all_point_export.append({
