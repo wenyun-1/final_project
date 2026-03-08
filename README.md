@@ -103,3 +103,26 @@ python SOC_Test_Innovation.py \
 - SOC：默认读取同一 `vehicle_split.csv`，训练仅使用 train 车辆，测试车从 test 车辆中自动选择；
 - SOC：默认仅放电段训练与评估（避免出现与任务定义不一致的 SOC 上升片段）；
 - `samples/`：仅作为格式样例，不参与正式实验统计。
+
+---
+
+## 5. 常见报错排查（本地文件与仓库不一致）
+
+如果出现类似报错：
+
+```text
+NameError: name 'shuffled' is not defined
+```
+
+且定位在 `class SOHDataset` 附近，通常是本地 `soh_final_pipeline.py` 发生了手工编辑/冲突残留，
+导致 `split_vehicles()` 的代码块被错误粘贴到类定义内部。
+
+建议直接用 Git 强制同步当前分支版本：
+
+```bash
+git fetch --all
+git reset --hard HEAD
+python -m py_compile soh_final_pipeline.py
+```
+
+若你本地在其他分支工作，请先切到目标分支再执行上述命令。
