@@ -5,7 +5,7 @@ import numpy as np
 import gc # 垃圾回收
 
 class RealVehicleDataset(Dataset):
-    def __init__(self, csv_file_path, window_size=30, sample_stride=10, is_train=True):
+    def __init__(self, csv_file_path, window_size=30, sample_stride=10, is_train=True, discharge_only=True):
         """
         :param sample_stride: 采样步长。
         """
@@ -50,6 +50,11 @@ class RealVehicleDataset(Dataset):
         del chunks_list
         gc.collect()
 
+        if discharge_only:
+            before = len(df)
+            df = df[df['Current'] > 0].copy()
+            print(f"Dataset: 放电过滤已启用，保留 {len(df)}/{before} 行 (Current>0)")
+
         # === 归一化 (逻辑不变) ===
         # 电流: 假设 -500 ~ 500
         self.curr_min, self.curr_max = -500.0, 500.0
@@ -79,7 +84,7 @@ class RealVehicleDataset(Dataset):
         gc.collect()
 
     def __len__(self):
-        return len(self.x_data) - self.window
+        return max(0, len(self.x_data) - self.window)
 
     def __getitem__(self, index):
         x_realtime = self.x_data[index : index + self.window]
