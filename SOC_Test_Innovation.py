@@ -106,6 +106,11 @@ def run_integrated_test(args):
     df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'], errors='coerce')
     df = df.dropna(subset=['DATA_TIME']).reset_index(drop=True)
 
+    if args.discharge_only:
+        df = df[df['totalCurrent'] > 0].copy()
+        df = df.reset_index(drop=True)
+        print(f"   -> 放电过滤已启用，剩余 {len(df)} 行")
+
     test_segment = df.iloc[args.segment_start:args.segment_end].reset_index(drop=True)
     if len(test_segment) <= args.window_size:
         raise ValueError("测试片段长度不足，无法形成窗口。请调整 --segment-start/--segment-end")
@@ -187,7 +192,12 @@ def build_args():
     parser.add_argument('--soh-base-date', default='2020-01-01')
     parser.add_argument('--default-soh', type=float, default=1.0)
     parser.add_argument('--figure-out', default='Macro_Micro_Coestimation_Result.png')
-    return parser.parse_args()
+    parser.add_argument('--discharge-only', action='store_true', default=True, help='仅在放电段评估（默认开启）')
+    parser.add_argument('--allow-charge', action='store_true', help='显式允许包含充电段；会覆盖 --discharge-only')
+    args = parser.parse_args()
+    if args.allow_charge:
+        args.discharge_only = False
+    return args
 
 
 if __name__ == "__main__":
