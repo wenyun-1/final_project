@@ -287,6 +287,55 @@ def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: L
     return rows
 
 
+def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
+    vehicles = sorted(vehicle_frames.keys())
+    if len(vehicles) < 2:
+        return vehicles, []
+    if cfg.split_mode == "intra_vehicle":
+        return vehicles, vehicles
+
+    rng = random.Random(cfg.seed)
+    shuffled = vehicles[:]
+    rng.shuffle(shuffled)
+    if cfg.test_vehicle_count > 0:
+        n_test = min(len(shuffled) - 1, cfg.test_vehicle_count)
+    else:
+        n_test = max(1, int(len(shuffled) * cfg.test_vehicle_ratio))
+        n_test = min(len(shuffled) - 1, n_test)
+
+    if cfg.train_vehicle_count > 0:
+        max_test_by_train = max(1, len(shuffled) - cfg.train_vehicle_count)
+        n_test = min(n_test, max_test_by_train)
+
+    test_vehicles = sorted(shuffled[:n_test])
+    remain = [v for v in shuffled if v not in set(test_vehicles)]
+    if cfg.train_vehicle_count > 0:
+        remain = remain[: cfg.train_vehicle_count]
+    train_vehicles = sorted(remain)
+    return train_vehicles, test_vehicles
+
+
+def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
+    rows: List[Dict] = []
+    for veh in vehicles:
+        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
+        records = frame.to_dict("records")
+        for i, r in enumerate(records):
+            prev = records[i - 1] if i > 0 else records[i]
+            rows.append(
+                {
+                    "Vehicle": veh,
+                    "days": int(r["days"]),
+                    "soh_true": float(r["soh_true"]),
+                    "curr_fp": r["fingerprint"],
+                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
+                    "prev_fp": prev["fingerprint"],
+                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
+                }
+            )
+    return rows
+
+
 class PIUAE(nn.Module):
     def __init__(self):
         super().__init__()
