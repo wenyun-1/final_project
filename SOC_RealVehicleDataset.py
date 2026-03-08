@@ -23,9 +23,14 @@ class RealVehicleDataset(Dataset):
         required_cols = ['Current', 'Voltage', 'Temperature', 'SOC', 'SOH']
         
         try:
-            reader = pd.read_csv(csv_file_path, usecols=required_cols, dtype='float32', chunksize=chunk_size)
+            reader = pd.read_csv(csv_file_path, chunksize=chunk_size)
             
             for i, chunk in enumerate(reader):
+                missing = [c for c in required_cols if c not in chunk.columns]
+                if missing:
+                    raise KeyError(f"输入数据缺少列: {missing}")
+                chunk = chunk[required_cols].copy()
+
                 # 1. 立即降采样：在这一小块数据中，每隔 stride 取一行
                 sampled_chunk = chunk.iloc[::sample_stride]
                 

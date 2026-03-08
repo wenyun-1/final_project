@@ -39,7 +39,7 @@ python soh_final_pipeline.py \
 ### 说明
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；
-- 默认采用 `10` 车训练 + `2` 车测试（可通过参数修改）；
+- 默认采用 **严格** `10` 车训练 + `2` 车测试（若车辆不足 12 会直接报错，而不是自动降级）；
 - 若内存紧张，可将 `--read-chunk-size` 调小（如 `50000` 或 `20000`）；
 - 运行中会打印 `[Load]`、`[Split]`、`[Data]`、`[Train]` 进度信息，便于确认程序未卡住；
 - 伪标签趋势拟合已加入数值稳定和退化回退机制，降低 `RankWarning` 风险。
@@ -62,6 +62,7 @@ python soh_final_pipeline.py \
 python SOC_Run_End2End.py \
   --data-folder data \
   --soh-mapping outputs_final/SOH_Predictions_For_SOC.csv \
+  --vehicle-split-file outputs_final/vehicle_split.csv \
   --epochs 20
 ```
 
@@ -72,6 +73,8 @@ python SOC_DataProcess_Real_Batch.py \
   --data-folder data \
   --soh-mapping outputs_final/SOH_Predictions_For_SOC.csv \
   --output-csv Processed_All_Bus_Data.csv \
+  --vehicle-split-file outputs_final/vehicle_split.csv \
+  --split-role train \
   --initial-soh-policy drop_until_first_valid
 
 python SOC_Train_Gated.py \
@@ -93,5 +96,7 @@ python SOC_Test_Innovation.py \
 ## 4. 当前实验口径（强烈建议）
 
 - SOH：跨车辆训练/测试（不做同车随机切分作为主结果）；
+- SOH：严格 10 车训练 + 2 车测试，并导出 `vehicle_split.csv`；
+- SOC：默认读取同一 `vehicle_split.csv`，训练仅使用 train 车辆，测试车从 test 车辆中自动选择；
 - SOC：默认仅放电段训练与评估（避免出现与任务定义不一致的 SOC 上升片段）；
 - `samples/`：仅作为格式样例，不参与正式实验统计。
