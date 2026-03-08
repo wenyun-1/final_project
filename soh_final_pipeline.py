@@ -17,6 +17,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -104,16 +105,38 @@ def _extract_from_one_segment(records: List[Dict], cfg: Config) -> Dict | None:
         return None
 
     curr_abs = df_seg["totalCurrent"].abs()
-    ah = (curr_abs * df_seg["DATA_TIME"].diff().dt.total_seconds().fillna(10)).sum() / 3600
+    dt_full = df_seg["DATA_TIME"].diff().dt.total_seconds().fillna(10)
+    ah = (curr_abs * dt_full).sum() / 3600
     raw_cap = ah / (soc_delta / 100.0)
 
     v_seq = df_sub["totalVoltage"].values
     f_interp = interp1d(np.linspace(0, 1, len(v_seq)), v_seq, kind="linear")
     fingerprint = (f_interp(np.linspace(0, 1, 100)) - V_START) / (V_END - V_START)
 
+    dt_sub = df_sub["DATA_TIME"].diff().dt.total_seconds().fillna(10)
+    charge_duration_h = float(dt_full.sum() / 3600.0)
+    sub_duration_h = float(dt_sub.sum() / 3600.0)
+    voltage_rise_rate = float((V_END - V_START) / max(sub_duration_h, 1e-6))
+
+    q_inc = (df_sub["totalCurrent"].abs().values * dt_sub.values) / 3600.0
+    q_cum = np.cumsum(q_inc)
+    dv = np.diff(df_sub["totalVoltage"].values)
+    dq = np.diff(q_cum)
+    valid = np.abs(dv) > 1e-4
+    if np.any(valid):
+        ic_curve = dq[valid] / dv[valid]
+        ic_peak = float(np.nanmax(np.clip(ic_curve, -500, 500)))
+    else:
+        ic_peak = 0.0
+
     return {
         "days": int((df_seg["DATA_TIME"].iloc[0] - pd.Timestamp("2020-01-01")).days),
         "raw_cap": float(raw_cap),
+        "charge_duration_h": charge_duration_h,
+        "sub_duration_h": sub_duration_h,
+        "soc_delta": float(soc_delta),
+        "voltage_rise_rate": voltage_rise_rate,
+        "ic_peak": ic_peak,
         "fingerprint": fingerprint,
         "avg_curr": float(df_sub["totalCurrent"].abs().mean()),
         "avg_temp": float(df_sub["maxTemperature"].mean()),
@@ -211,6 +234,54 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
     return df
 
 
+def _save_corr_heatmap(corr_df: pd.DataFrame, out_png: str, title: str) -> None:
+    labels = corr_df.columns.tolist()
+    arr = corr_df.values
+    fig, ax = plt.subplots(figsize=(8, 6.8))
+    im = ax.imshow(arr, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            ax.text(j, i, f"{arr[i, j]:.2f}", ha="center", va="center", fontsize=8)
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=260)
+    plt.close(fig)
+
+
+def export_feature_correlation(vehicle_frames: Dict[str, pd.DataFrame], output_dir: str) -> None:
+    merged = []
+    for veh, frame in vehicle_frames.items():
+        tmp = frame.copy()
+        tmp["Vehicle"] = veh
+        merged.append(tmp)
+    if not merged:
+        return
+
+    df = pd.concat(merged, ignore_index=True)
+    hi_cols = [
+        "raw_cap", "charge_duration_h", "sub_duration_h", "soc_delta",
+        "avg_curr", "avg_temp", "voltage_rise_rate", "ic_peak", "soh_true"
+    ]
+    hi_cols = [c for c in hi_cols if c in df.columns]
+    if len(hi_cols) < 3:
+        return
+
+    hi_df = df[hi_cols].copy()
+    hi_df.to_csv(os.path.join(output_dir, "hi_features_all_samples.csv"), index=False)
+
+    pear = hi_df.corr(method="pearson")
+    spear = hi_df.corr(method="spearman")
+    pear.to_csv(os.path.join(output_dir, "hi_corr_pearson.csv"))
+    spear.to_csv(os.path.join(output_dir, "hi_corr_spearman.csv"))
+    _save_corr_heatmap(pear, os.path.join(output_dir, "hi_corr_pearson_heatmap.png"), "Pearson Correlation Heatmap")
+    _save_corr_heatmap(spear, os.path.join(output_dir, "hi_corr_spearman_heatmap.png"), "Spearman Correlation Heatmap")
+
+
 class SOHDataset(Dataset):
     def __init__(self, rows: List[Dict], mean: np.ndarray, std: np.ndarray):
         self.rows = rows
@@ -233,6 +304,33 @@ class SOHDataset(Dataset):
             r["days"],
             r["Vehicle"],
         )
+
+    test_vehicles = sorted(shuffled[:n_test])
+    remain = [v for v in shuffled if v not in set(test_vehicles)]
+    remain = remain[:n_train]
+    train_vehicles = sorted(remain)
+    return train_vehicles, test_vehicles
+
+
+def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
+    rows: List[Dict] = []
+    for veh in vehicles:
+        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
+        records = frame.to_dict("records")
+        for i, r in enumerate(records):
+            prev = records[i - 1] if i > 0 else records[i]
+            rows.append(
+                {
+                    "Vehicle": veh,
+                    "days": int(r["days"]),
+                    "soh_true": float(r["soh_true"]),
+                    "curr_fp": r["fingerprint"],
+                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
+                    "prev_fp": prev["fingerprint"],
+                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
+                }
+            )
+    return rows
 
 
 def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
@@ -374,8 +472,11 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
                   [{"Vehicle": v, "Role": "test"} for v in test_vehicles])
     pd.DataFrame(split_rows).to_csv(os.path.join(output_dir, "vehicle_split.csv"), index=False)
 
-    for veh in test_vehicles:
-        veh_rows = [r for r in test_rows if r["Vehicle"] == veh]
+    eval_vehicles = sorted(vehicle_frames.keys())
+    test_set = set(test_vehicles)
+
+    for veh in eval_vehicles:
+        veh_rows = build_rows_for_vehicles(vehicle_frames, [veh])
         if len(veh_rows) < 5:
             continue
         test_ds = SOHDataset(veh_rows, mean=mean, std=std)
@@ -396,17 +497,18 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         y_pred = np.array(y_pred)[idx]
         y_pred_filtered = pd.Series(y_pred).rolling(window=cfg.smooth_window, min_periods=1, center=True).mean().values
 
-        metrics = {
-            "Vehicle": veh,
-            "N_test": len(y_true),
-            "RMSE_raw": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-            "MAE_raw": float(mean_absolute_error(y_true, y_pred)),
-            "R2_raw": float(r2_score(y_true, y_pred)),
-            "RMSE_filtered": float(np.sqrt(mean_squared_error(y_true, y_pred_filtered))),
-            "MAE_filtered": float(mean_absolute_error(y_true, y_pred_filtered)),
-            "R2_filtered": float(r2_score(y_true, y_pred_filtered)),
-        }
-        all_metrics.append(metrics)
+        if veh in test_set:
+            metrics = {
+                "Vehicle": veh,
+                "N_test": len(y_true),
+                "RMSE_raw": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                "MAE_raw": float(mean_absolute_error(y_true, y_pred)),
+                "R2_raw": float(r2_score(y_true, y_pred)),
+                "RMSE_filtered": float(np.sqrt(mean_squared_error(y_true, y_pred_filtered))),
+                "MAE_filtered": float(mean_absolute_error(y_true, y_pred_filtered)),
+                "R2_filtered": float(r2_score(y_true, y_pred_filtered)),
+            }
+            all_metrics.append(metrics)
 
         for d, yt, yr, yf in zip(days, y_true, y_pred, y_pred_filtered):
             all_point_export.append({
@@ -503,6 +605,8 @@ def main() -> None:
         print("❌ 没有可用车辆样本，建议调低筛选阈值或调整电压窗口。")
         return
 
+    export_feature_correlation(frames, args.output)
+
     metrics = train_and_eval(frames, cfg, args.output)
     if metrics.empty:
         print("❌ 训练/评估阶段无有效输出。")
@@ -514,6 +618,11 @@ def main() -> None:
     print(f"- {args.output}/SOH_Predictions_For_SOC.csv")
     print(f"- {args.output}/soh_predictions_points.csv")
     print(f"- {args.output}/vehicle_split.csv")
+    print(f"- {args.output}/hi_features_all_samples.csv")
+    print(f"- {args.output}/hi_corr_pearson.csv")
+    print(f"- {args.output}/hi_corr_spearman.csv")
+    print(f"- {args.output}/hi_corr_pearson_heatmap.png")
+    print(f"- {args.output}/hi_corr_spearman_heatmap.png")
 
 
 if __name__ == "__main__":

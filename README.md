@@ -50,6 +50,9 @@ python soh_final_pipeline.py \
 - `outputs_final/soh_predictions_points.csv`
 - `outputs_final/SOH_Predictions_For_SOC.csv`
 - `outputs_final/*_pseudo_labels.csv`
+- `outputs_final/hi_features_all_samples.csv`（健康特征样本表）
+- `outputs_final/hi_corr_pearson.csv`、`outputs_final/hi_corr_spearman.csv`
+- `outputs_final/hi_corr_pearson_heatmap.png`、`outputs_final/hi_corr_spearman_heatmap.png`
 
 ---
 
@@ -74,6 +77,7 @@ python SOC_DataProcess_Real_Batch.py \
   --output-csv Processed_All_Bus_Data.csv \
   --vehicle-split-file outputs_final/vehicle_split.csv \
   --split-role train \
+  --read-chunk-size 200000 \
   --initial-soh-policy drop_until_first_valid
 
 python SOC_Train_Gated.py \
