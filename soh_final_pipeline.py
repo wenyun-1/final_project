@@ -12,6 +12,8 @@ import argparse
 import glob
 import os
 import random
+import re
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -25,7 +27,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from torch.utils.data import DataLoader, Dataset
 
 TIME_FORMAT = "mixed"
-DATA_DIRS = ["data", "data1", "samples"]
+DATA_DIRS = ["data", "data1"]
 DEFAULT_OUTPUT_DIR = "outputs_final"
 
 # 电压窗口建议选在相对稳定恒流区，可按车型调参
@@ -61,6 +63,15 @@ def collect_files(data_dirs: List[str]) -> List[str]:
     for d in data_dirs:
         files.extend(glob.glob(os.path.join(d, "*.csv")))
     return sorted(set(files))
+
+
+def normalize_vehicle_name(file_stem: str) -> str:
+    """将不同命名风格归一到同一车辆键，避免同车跨集合泄漏。"""
+    name = file_stem.strip()
+    m = re.search(r"(EV\d+)", name, flags=re.IGNORECASE)
+    if m:
+        return f"LFP604{m.group(1).upper()}"
+    return name
 
 
 def read_vehicle_csv(path: str) -> pd.DataFrame:
@@ -150,8 +161,26 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
     baseline_cap = float(np.percentile(df["raw_cap_clip"].iloc[:n_head], 85))
 
     # 一阶拟合抽取“本征衰减主趋势”
-    z = np.polyfit(df["days"], df["raw_cap_clip"], 1)
-    trend_cap = np.poly1d(z)(df["days"]) if robust_linear else df["raw_cap_clip"].values
+    days = df["days"].to_numpy(dtype=float)
+    raw_cap_clip = df["raw_cap_clip"].to_numpy(dtype=float)
+    if robust_linear:
+        # 先做中心化，降低病态拟合概率；同时约束衰减斜率不为正
+        if np.unique(days).size >= 2:
+            x = days - days.mean()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", np.RankWarning)
+                    z = np.polyfit(x, raw_cap_clip, 1)
+                z[0] = min(z[0], 0.0)
+                trend_cap = np.poly1d(z)(x)
+            except np.RankWarning:
+                # 退化方案：滚动中位数 + 单调衰减约束
+                trend_cap = pd.Series(raw_cap_clip).rolling(window=7, min_periods=1, center=True).median().values
+                trend_cap = np.minimum.accumulate(trend_cap)
+        else:
+            trend_cap = np.full_like(raw_cap_clip, float(np.median(raw_cap_clip)))
+    else:
+        trend_cap = raw_cap_clip
 
     soh_true = (trend_cap / baseline_cap) * 100.0
     soh_true = np.clip(soh_true, 0.0, 100.0)
@@ -359,20 +388,27 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
 
 def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict[str, pd.DataFrame]:
-    frames: Dict[str, pd.DataFrame] = {}
+    seg_by_vehicle: Dict[str, List[Dict]] = {}
     for f in files:
-        veh = os.path.splitext(os.path.basename(f))[0]
+        veh_file = os.path.splitext(os.path.basename(f))[0]
+        veh = normalize_vehicle_name(veh_file)
         try:
             df = read_vehicle_csv(f)
             segs = extract_segments(df, cfg)
-            labeled = build_pseudo_labels(segs, robust_linear=True)
-            if not labeled.empty:
-                frames[veh] = labeled
-                labeled[["days", "raw_cap", "raw_cap_clip", "baseline_cap", "soh_true"]].to_csv(
-                    os.path.join(output_dir, f"{veh}_pseudo_labels.csv"), index=False
-                )
+            if len(segs) > 0:
+                seg_by_vehicle.setdefault(veh, []).extend(segs)
         except Exception as e:
-            print(f"[WARN] {veh} 处理失败: {e}")
+            print(f"[WARN] {veh_file} 处理失败: {e}")
+
+    frames: Dict[str, pd.DataFrame] = {}
+    for veh, segs in seg_by_vehicle.items():
+        labeled = build_pseudo_labels(segs, robust_linear=True)
+        if labeled.empty:
+            continue
+        frames[veh] = labeled
+        labeled[["days", "raw_cap", "raw_cap_clip", "baseline_cap", "soh_true"]].to_csv(
+            os.path.join(output_dir, f"{veh}_pseudo_labels.csv"), index=False
+        )
     return frames
 
 
@@ -384,6 +420,7 @@ def main() -> None:
     parser.add_argument("--smooth-window", type=int, default=15)
     parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
     parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
+    parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
     args = parser.parse_args()
 
     cfg = Config(
@@ -396,9 +433,9 @@ def main() -> None:
     set_seed(cfg.seed)
 
     os.makedirs(args.output, exist_ok=True)
-    files = collect_files(DATA_DIRS)
+    files = collect_files(args.data_dirs)
     if not files:
-        print("❌ 未找到CSV数据，请将文件放入 data/ 或 data1/")
+        print(f"❌ 未找到CSV数据，请检查目录: {args.data_dirs}")
         return
 
     frames = build_vehicle_frames(files, cfg, args.output)
