@@ -17,6 +17,7 @@ GAP_THRESHOLD_SEC = 1800
 SOH_BASE_DATE = "2020-01-01"
 INITIAL_SOH_POLICY = "drop_until_first_valid"  # "drop_until_first_valid" 或 "fill_default"
 DEFAULT_INITIAL_SOH = 1.0
+VEHICLE_SPLIT_FILE = "outputs_final/vehicle_split.csv"
 # ===========================================================
 
 
@@ -26,8 +27,26 @@ def _normalize_vehicle_key(name):
     s = name.strip()
     m = re.search(r'(EV\d+)', s, flags=re.IGNORECASE)
     if m:
-        return m.group(1).upper()
+        return f"LFP604{m.group(1).upper()}"
     return s.upper()
+
+
+def _load_allowed_vehicle_keys(split_file, split_role):
+    if not split_file:
+        return None
+    if not os.path.exists(split_file):
+        raise FileNotFoundError(f"找不到 vehicle_split 文件: {split_file}")
+    split_df = pd.read_csv(split_file)
+    if not {"Vehicle", "Role"}.issubset(split_df.columns):
+        raise KeyError("vehicle_split.csv 需要包含 Vehicle, Role 两列。")
+    if split_role not in {"train", "test", "all"}:
+        raise ValueError("split_role 仅支持 train/test/all")
+    if split_role == "all":
+        target = split_df.copy()
+    else:
+        target = split_df[split_df["Role"].astype(str).str.lower() == split_role].copy()
+    keys = {_normalize_vehicle_key(v) for v in target["Vehicle"].astype(str).tolist()}
+    return keys
 
 
 def _resolve_vehicle_rows(soh_mapping_df, veh_name):
@@ -103,10 +122,15 @@ def process_integrated(args):
         raise KeyError("SOH 映射文件缺少 Vehicle 列。")
 
     global_cycle_offset = 0
+    allowed_keys = _load_allowed_vehicle_keys(args.vehicle_split_file, args.split_role)
 
     for i, file_path in enumerate(csv_files):
         file_name = os.path.basename(file_path)
         veh_name = file_name.split('.')[0]
+        veh_key = _normalize_vehicle_key(veh_name)
+        if allowed_keys is not None and veh_key not in allowed_keys:
+            print(f"\n>>> [{i+1}/{len(csv_files)}] 跳过: {veh_name} (不在 {args.split_role} 列表)")
+            continue
         print(f"\n>>> [{i+1}/{len(csv_files)}] 正在处理: {veh_name}")
 
         try:
@@ -160,13 +184,16 @@ def process_integrated(args):
 
             temp_mean = ((df['maxTemperature'] + df['minTemperature']) / 2).ffill()
             final_df = pd.DataFrame({
+                'Vehicle': veh_key,
                 'Current': df['totalCurrent'],
                 'Voltage': df['totalVoltage'],
                 'Temperature': temp_mean,
                 'SOC': df['SOC'],
                 'Cycle_ID': df['Cycle_ID'],
                 'SOH': df['SOH'],
-            }).astype('float32')
+            })
+            for c in ['Current', 'Voltage', 'Temperature', 'SOC', 'Cycle_ID', 'SOH']:
+                final_df[c] = pd.to_numeric(final_df[c], errors='coerce').astype('float32')
 
             write_header = (i == 0)
             final_df.to_csv(args.output_csv, mode='a', index=False, header=write_header)
@@ -195,6 +222,8 @@ def build_args():
         help='首个有效 SOH 更新前数据处理策略',
     )
     parser.add_argument('--default-initial-soh', type=float, default=DEFAULT_INITIAL_SOH, help='默认 SOH 值')
+    parser.add_argument('--vehicle-split-file', default=VEHICLE_SPLIT_FILE, help='SOH阶段输出的车辆划分文件；留空表示不过滤车辆')
+    parser.add_argument('--split-role', default='train', choices=['train', 'test', 'all'], help='根据划分文件选择处理哪些车辆')
     return parser.parse_args()
 
 
