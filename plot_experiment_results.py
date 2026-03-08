@@ -109,7 +109,7 @@ def plot_chapter3_subplot(soh_output: str, out_dir: str) -> Optional[str]:
         g = veh_data[veh].sort_values("Days")
 
         if "SOH_pred_raw" in g.columns and g["SOH_pred_raw"].notna().any():
-            ax.scatter(g["Days"], g["SOH_pred_raw"], s=14, c="gray", alpha=0.55, label="Estimated points")
+            ax.scatter(g["Days"], g["SOH_pred_raw"], s=14, c="#4e79a7", alpha=0.55, label="Estimated points")
         elif g["SOH_true"].notna().any():
             ax.scatter(g["Days"], g["SOH_true"], s=14, c="black", alpha=0.65, label="True SOH")
 
