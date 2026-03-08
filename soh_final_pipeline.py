@@ -13,7 +13,7 @@ import glob
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,8 @@ class Config:
     max_gap_seconds: int = 60
     min_soc_delta: float = 20.0
     train_split_mod: int = 5
+    split_mode: str = "cross_vehicle"
+    test_vehicle_ratio: float = 0.3
 
 
 def set_seed(seed: int) -> None:
@@ -160,21 +162,7 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
 
 
 class SOHDataset(Dataset):
-    def __init__(self, frame: pd.DataFrame, is_train: bool, split_mod: int, scaler_path: str):
-        all_rows = frame.to_dict("records")
-        if is_train:
-            rows = [r for i, r in enumerate(all_rows) if i % split_mod != 0]
-        else:
-            rows = [r for i, r in enumerate(all_rows) if i % split_mod == 0]
-
-        if is_train:
-            scalars = np.array([[r["avg_curr"], r["avg_temp"]] for r in rows])
-            mean, std = scalars.mean(0), scalars.std(0) + 1e-6
-            np.savez(scaler_path, mean=mean, std=std)
-        else:
-            stats = np.load(scaler_path)
-            mean, std = stats["mean"], stats["std"]
-
+    def __init__(self, rows: List[Dict], mean: np.ndarray, std: np.ndarray):
         self.rows = rows
         self.mean, self.std = mean, std
 
@@ -183,18 +171,56 @@ class SOHDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.rows[idx]
-        prev = self.rows[max(0, idx - 1)]
-        curr_sc = (np.array([r["avg_curr"], r["avg_temp"]]) - self.mean) / self.std
-        prev_sc = (np.array([prev["avg_curr"], prev["avg_temp"]]) - self.mean) / self.std
+        curr_sc = (np.array(r["curr_sc_raw"]) - self.mean) / self.std
+        prev_sc = (np.array(r["prev_sc_raw"]) - self.mean) / self.std
         y = r["soh_true"] / 100.0
         return (
-            torch.tensor(r["fingerprint"], dtype=torch.float32).unsqueeze(0),
+            torch.tensor(r["curr_fp"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(curr_sc, dtype=torch.float32),
-            torch.tensor(prev["fingerprint"], dtype=torch.float32).unsqueeze(0),
+            torch.tensor(r["prev_fp"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(prev_sc, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32),
             r["days"],
+            r["Vehicle"],
         )
+
+
+def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
+    vehicles = sorted(vehicle_frames.keys())
+    if len(vehicles) < 2:
+        return vehicles, []
+    if cfg.split_mode == "intra_vehicle":
+        return vehicles, vehicles
+
+    rng = random.Random(cfg.seed)
+    shuffled = vehicles[:]
+    rng.shuffle(shuffled)
+    n_test = max(1, int(len(shuffled) * cfg.test_vehicle_ratio))
+    n_test = min(len(shuffled) - 1, n_test)
+    test_vehicles = sorted(shuffled[:n_test])
+    train_vehicles = sorted([v for v in shuffled if v not in set(test_vehicles)])
+    return train_vehicles, test_vehicles
+
+
+def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
+    rows: List[Dict] = []
+    for veh in vehicles:
+        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
+        records = frame.to_dict("records")
+        for i, r in enumerate(records):
+            prev = records[i - 1] if i > 0 else records[i]
+            rows.append(
+                {
+                    "Vehicle": veh,
+                    "days": int(r["days"]),
+                    "soh_true": float(r["soh_true"]),
+                    "curr_fp": r["fingerprint"],
+                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
+                    "prev_fp": prev["fingerprint"],
+                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
+                }
+            )
+    return rows
 
 
 class PIUAE(nn.Module):
@@ -230,42 +256,54 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     all_soc_export = []
     all_point_export = []
 
-    for veh, frame in vehicle_frames.items():
-        if len(frame) < 30:
+    train_vehicles, test_vehicles = split_vehicles(vehicle_frames, cfg)
+    if not test_vehicles:
+        print("❌ 可用车辆数不足，无法执行跨车测试。")
+        return pd.DataFrame()
+
+    train_rows = build_rows_for_vehicles(vehicle_frames, train_vehicles)
+    test_rows = build_rows_for_vehicles(vehicle_frames, test_vehicles)
+    if len(train_rows) == 0 or len(test_rows) == 0:
+        print("❌ 训练或测试样本为空。")
+        return pd.DataFrame()
+
+    scalars = np.array([r["curr_sc_raw"] for r in train_rows])
+    mean, std = scalars.mean(0), scalars.std(0) + 1e-6
+    np.savez(os.path.join(output_dir, "global_scaler.npz"), mean=mean, std=std)
+
+    train_ds = SOHDataset(train_rows, mean=mean, std=std)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+
+    model = PIUAE().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    mse = nn.MSELoss()
+    for _ in range(cfg.epochs):
+        model.train()
+        for c_fp, c_sc, p_fp, p_sc, y, _, _ in train_loader:
+            c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
+            y_pred, recon = model(c_fp, c_sc)
+            y_prev, _ = model(p_fp, p_sc)
+            loss = mse(y_pred.squeeze(), y) + cfg.lambda_recon * mse(recon, c_fp) + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    torch.save(model.state_dict(), os.path.join(output_dir, "global_pi_uae.pth"))
+
+    print(f"[Split] 训练车辆 {len(train_vehicles)}: {train_vehicles}")
+    print(f"[Split] 测试车辆 {len(test_vehicles)}: {test_vehicles}")
+
+    for veh in test_vehicles:
+        veh_rows = [r for r in test_rows if r["Vehicle"] == veh]
+        if len(veh_rows) < 5:
             continue
-
-        scaler_path = os.path.join(output_dir, f"{veh}_scaler.npz")
-        model_path = os.path.join(output_dir, f"{veh}_pi_uae.pth")
-
-        train_ds = SOHDataset(frame, is_train=True, split_mod=cfg.train_split_mod, scaler_path=scaler_path)
-        test_ds = SOHDataset(frame, is_train=False, split_mod=cfg.train_split_mod, scaler_path=scaler_path)
-        if len(train_ds) == 0 or len(test_ds) == 0:
-            continue
-
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+        test_ds = SOHDataset(veh_rows, mean=mean, std=std)
         test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
-
-        model = PIUAE().to(device)
-        optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
-        mse = nn.MSELoss()
-
-        for _ in range(cfg.epochs):
-            model.train()
-            for c_fp, c_sc, p_fp, p_sc, y, _ in train_loader:
-                c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
-                y_pred, recon = model(c_fp, c_sc)
-                y_prev, _ = model(p_fp, p_sc)
-                loss = mse(y_pred.squeeze(), y) + cfg.lambda_recon * mse(recon, c_fp) + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        torch.save(model.state_dict(), model_path)
 
         model.eval()
         days, y_true, y_pred = [], [], []
         with torch.no_grad():
-            for c_fp, c_sc, _, _, y, d in test_loader:
+            for c_fp, c_sc, _, _, y, d, _ in test_loader:
                 p, _ = model(c_fp.to(device), c_sc.to(device))
                 y_pred.extend((p.cpu().numpy().flatten() * 100).tolist())
                 y_true.extend((y.numpy() * 100).tolist())
@@ -344,9 +382,17 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smooth-window", type=int, default=15)
+    parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
+    parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
     args = parser.parse_args()
 
-    cfg = Config(epochs=args.epochs, seed=args.seed, smooth_window=args.smooth_window)
+    cfg = Config(
+        epochs=args.epochs,
+        seed=args.seed,
+        smooth_window=args.smooth_window,
+        split_mode=args.split_mode,
+        test_vehicle_ratio=args.test_vehicle_ratio,
+    )
     set_seed(cfg.seed)
 
     os.makedirs(args.output, exist_ok=True)
