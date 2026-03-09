@@ -28,8 +28,9 @@ python soh_final_pipeline.py \
   --read-chunk-size 200000 \
   --epochs 120 \
   --split-mode cross_vehicle \
-  --train-vehicle-count 10 \
-  --test-vehicle-count 2 \
+  --train-vehicle-count 9 \
+  --test-vehicle-count 3 \
+  --test-vehicles LFP604EV3 LFP604EV10 LFP604EV9 \
   --log-every-epoch 10 \
   --smooth-window 15 \
   --output outputs_final
@@ -65,7 +66,7 @@ python soh_run_reuse.py --data-dirs data --output outputs_final
 ### 说明
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；
-- 默认采用 **严格** `10` 车训练 + `2` 车测试（若车辆不足 12 会直接报错，而不是自动降级）；
+- 默认采用 **严格** `9` 车训练 + `3` 车测试（测试车固定为 `EV3/EV10/EV9`）；
 - 若内存紧张，可将 `--read-chunk-size` 调小（如 `50000` 或 `20000`）；
 - 运行中会打印 `[Load]`、`[Split]`、`[Data]`、`[Train]` 进度信息，便于确认程序未卡住；
 - 伪标签趋势拟合已加入数值稳定和退化回退机制，降低 `RankWarning` 风险。
@@ -75,6 +76,7 @@ python soh_run_reuse.py --data-dirs data --output outputs_final
 - `outputs_final/soh_metrics_vehicle.csv`
 - `outputs_final/soh_metrics_summary.csv`
 - `outputs_final/soh_predictions_points.csv`
+- `outputs_final/soh_test_vehicles_with_error.png`（三行子图：左侧SOH估计，右侧误差曲线）
 - `outputs_final/SOH_Predictions_For_SOC.csv`
 - `outputs_final/*_pseudo_labels.csv`
 - `outputs_final/hi_features_all_samples.csv`（健康特征样本表）

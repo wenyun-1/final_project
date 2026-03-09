@@ -16,7 +16,7 @@ import os
 import random
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -53,8 +53,9 @@ class Config:
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
-    train_vehicle_count: int = 10
-    test_vehicle_count: int = 2
+    train_vehicle_count: int = 9
+    test_vehicle_count: int = 3
+    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV3", "LFP604EV10", "LFP604EV9"])
     read_chunk_size: int = 200000
     log_every_epoch: int = 10
     use_segment_cache: bool = True
@@ -359,33 +360,6 @@ class SOHDataset(Dataset):
             r["Vehicle"],
         )
 
-    test_vehicles = sorted(shuffled[:n_test])
-    remain = [v for v in shuffled if v not in set(test_vehicles)]
-    remain = remain[:n_train]
-    train_vehicles = sorted(remain)
-    return train_vehicles, test_vehicles
-
-
-def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
-    rows: List[Dict] = []
-    for veh in vehicles:
-        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
-        records = frame.to_dict("records")
-        for i, r in enumerate(records):
-            prev = records[i - 1] if i > 0 else records[i]
-            rows.append(
-                {
-                    "Vehicle": veh,
-                    "days": int(r["days"]),
-                    "soh_true": float(r["soh_true"]),
-                    "curr_fp": r["fingerprint"],
-                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
-                    "prev_fp": prev["fingerprint"],
-                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
-                }
-            )
-    return rows
-
 
 def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
     vehicles = sorted(vehicle_frames.keys())
@@ -397,6 +371,17 @@ def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tupl
     rng = random.Random(cfg.seed)
     shuffled = vehicles[:]
     rng.shuffle(shuffled)
+    if cfg.fixed_test_vehicles:
+        fixed = [normalize_vehicle_name(v) for v in cfg.fixed_test_vehicles]
+        miss = [v for v in fixed if v not in vehicles]
+        if miss:
+            raise ValueError(f"指定测试车辆不存在: {miss}，当前车辆: {vehicles}")
+        test_vehicles = sorted(fixed)
+        train_vehicles = sorted([v for v in vehicles if v not in set(test_vehicles)])
+        if cfg.train_vehicle_count > 0 and len(train_vehicles) != cfg.train_vehicle_count:
+            raise ValueError(f"训练车辆数异常: 期望 {cfg.train_vehicle_count}, 实际 {len(train_vehicles)}")
+        return train_vehicles, test_vehicles
+
     if cfg.test_vehicle_count > 0:
         n_test = cfg.test_vehicle_count
     else:
@@ -550,6 +535,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
     eval_vehicles = sorted(vehicle_frames.keys())
     test_set = set(test_vehicles)
+    error_plot_cache: Dict[str, Dict[str, np.ndarray]] = {}
 
     for veh in eval_vehicles:
         veh_rows = build_rows_for_vehicles(vehicle_frames, [veh])
@@ -585,6 +571,12 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
                 "R2_filtered": float(r2_score(y_true, y_pred_filtered)),
             }
             all_metrics.append(metrics)
+            error_plot_cache[veh] = {
+                "days": days,
+                "y_true": y_true,
+                "y_pred_raw": y_pred,
+                "y_pred_filtered": y_pred_filtered,
+            }
 
         for d, yt, yr, yf in zip(days, y_true, y_pred, y_pred_filtered):
             all_point_export.append({
@@ -613,6 +605,43 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     soc_df = pd.DataFrame(all_soc_export)
     if not soc_df.empty:
         soc_df.to_csv(os.path.join(output_dir, "SOH_Predictions_For_SOC.csv"), index=False)
+
+    target_order = [normalize_vehicle_name(v) for v in cfg.fixed_test_vehicles] if cfg.fixed_test_vehicles else sorted(test_set)
+    target_order = [v for v in target_order if v in error_plot_cache]
+    if target_order:
+        fig, axes = plt.subplots(len(target_order), 2, figsize=(14, 4.2 * len(target_order)), sharex=False)
+        axes = np.array(axes).reshape(len(target_order), 2)
+        for i, veh in enumerate(target_order):
+            dat = error_plot_cache[veh]
+            days = dat["days"]
+            y_true = dat["y_true"]
+            y_pred_raw = dat["y_pred_raw"]
+            y_pred_f = dat["y_pred_filtered"]
+
+            ax_l = axes[i, 0]
+            ax_l.scatter(days, y_pred_raw, s=12, c="#4e79a7", alpha=0.5, label="Estimated points")
+            ax_l.plot(days, y_pred_f, c="#e15759", lw=2.0, label="SOH degradation trend")
+            ax_l.plot(days, y_true, c="black", lw=1.4, alpha=0.8, label="Pseudo True SOH")
+            ax_l.set_title(f"{veh} SOH Estimation")
+            ax_l.set_ylabel("SOH (%)")
+            ax_l.grid(alpha=0.25)
+            ax_l.legend(loc="best")
+
+            err = y_pred_f - y_true
+            ax_r = axes[i, 1]
+            ax_r.axhline(0, color="gray", lw=1.0)
+            ax_r.plot(days, err, c="#f28e2b", lw=1.6)
+            ax_r.fill_between(days, 0, err, color="#f28e2b", alpha=0.2)
+            ax_r.set_title(f"{veh} Error (Pred-True)")
+            ax_r.set_ylabel("Error (%)")
+            ax_r.grid(alpha=0.25)
+
+            axes[i, 0].set_xlabel("Days")
+            axes[i, 1].set_xlabel("Days")
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, "soh_test_vehicles_with_error.png"), dpi=260)
+        plt.close(fig)
 
     return metric_df
 
@@ -660,8 +689,9 @@ def main() -> None:
     parser.add_argument("--smooth-window", type=int, default=15)
     parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
     parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
-    parser.add_argument("--train-vehicle-count", type=int, default=10, help="跨车训练车辆数（<=0 表示不限制）")
-    parser.add_argument("--test-vehicle-count", type=int, default=2, help="跨车测试车辆数（<=0 表示按比例）")
+    parser.add_argument("--train-vehicle-count", type=int, default=9, help="跨车训练车辆数（<=0 表示不限制）")
+    parser.add_argument("--test-vehicle-count", type=int, default=3, help="跨车测试车辆数（<=0 表示按比例）")
+    parser.add_argument("--test-vehicles", nargs="*", default=["LFP604EV3", "LFP604EV10", "LFP604EV9"], help="固定测试车辆列表")
     parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
     parser.add_argument("--read-chunk-size", type=int, default=200000, help="分块读取行数，内存不足时可调小")
     parser.add_argument("--log-every-epoch", type=int, default=10, help="每隔多少个epoch打印训练进度")
@@ -678,6 +708,7 @@ def main() -> None:
         test_vehicle_ratio=args.test_vehicle_ratio,
         train_vehicle_count=args.train_vehicle_count,
         test_vehicle_count=args.test_vehicle_count,
+        fixed_test_vehicles=args.test_vehicles,
         read_chunk_size=args.read_chunk_size,
         log_every_epoch=args.log_every_epoch,
         use_segment_cache=(not args.no_segment_cache),
@@ -715,6 +746,7 @@ def main() -> None:
     print(f"- {args.output}/hi_corr_spearman.csv")
     print(f"- {args.output}/hi_corr_pearson_heatmap.png")
     print(f"- {args.output}/hi_corr_spearman_heatmap.png")
+    print(f"- {args.output}/soh_test_vehicles_with_error.png")
 
 
 if __name__ == "__main__":
