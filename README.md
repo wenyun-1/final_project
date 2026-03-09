@@ -35,6 +35,33 @@ python soh_final_pipeline.py \
   --output outputs_final
 ```
 
+> 默认会把每辆车的“充电片段提取结果”缓存到 `outputs_final/segment_cache/`。
+> 下次再次运行会优先读取缓存（日志显示 `[LoadCache]`），避免重复解析大 CSV。
+
+若希望强制重建缓存：
+
+```bash
+python soh_final_pipeline.py --data-dirs data --refresh-segment-cache
+```
+
+若希望不使用缓存：
+
+```bash
+python soh_final_pipeline.py --data-dirs data --no-segment-cache
+```
+
+### 训练集不变时的快速运行（跳过训练）
+
+新增脚本：`soh_run_reuse.py`
+
+```bash
+python soh_run_reuse.py --data-dirs data --output outputs_final
+```
+
+机制说明：
+- 若检测到训练车辆集合和样本规模未变化，且 `global_pi_uae.pth` 已存在，则直接复用模型并跳过训练；
+- 若训练集发生变化，则自动重新训练并更新模型。
+
 ### 说明
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；

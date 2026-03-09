@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import inspect
 import os
 import random
@@ -56,6 +57,9 @@ class Config:
     test_vehicle_count: int = 2
     read_chunk_size: int = 200000
     log_every_epoch: int = 10
+    use_segment_cache: bool = True
+    refresh_segment_cache: bool = False
+    reuse_if_same_trainset: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -206,6 +210,41 @@ def extract_segments_from_file(path: str, cfg: Config) -> List[Dict]:
     return out
 
 
+def _save_segments_cache(path: str, segs: List[Dict]) -> None:
+    if len(segs) == 0:
+        return
+    rows = []
+    fps = []
+    for s in segs:
+        rows.append(
+            {
+                "days": int(s["days"]),
+                "raw_cap": float(s["raw_cap"]),
+                "charge_duration_h": float(s["charge_duration_h"]),
+                "sub_duration_h": float(s["sub_duration_h"]),
+                "soc_delta": float(s["soc_delta"]),
+                "voltage_rise_rate": float(s["voltage_rise_rate"]),
+                "ic_peak": float(s["ic_peak"]),
+                "avg_curr": float(s["avg_curr"]),
+                "avg_temp": float(s["avg_temp"]),
+            }
+        )
+        fps.append(np.asarray(s["fingerprint"], dtype=np.float32))
+    np.savez_compressed(path, meta=np.array(rows, dtype=object), fingerprint=np.stack(fps, axis=0))
+
+
+def _load_segments_cache(path: str) -> List[Dict]:
+    z = np.load(path, allow_pickle=True)
+    meta = list(z["meta"])
+    fps = z["fingerprint"]
+    out: List[Dict] = []
+    for i, m in enumerate(meta):
+        d = dict(m)
+        d["fingerprint"] = fps[i]
+        out.append(d)
+    return out
+
+
 def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
@@ -320,6 +359,33 @@ class SOHDataset(Dataset):
             r["Vehicle"],
         )
 
+    test_vehicles = sorted(shuffled[:n_test])
+    remain = [v for v in shuffled if v not in set(test_vehicles)]
+    remain = remain[:n_train]
+    train_vehicles = sorted(remain)
+    return train_vehicles, test_vehicles
+
+
+def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
+    rows: List[Dict] = []
+    for veh in vehicles:
+        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
+        records = frame.to_dict("records")
+        for i, r in enumerate(records):
+            prev = records[i - 1] if i > 0 else records[i]
+            rows.append(
+                {
+                    "Vehicle": veh,
+                    "days": int(r["days"]),
+                    "soh_true": float(r["soh_true"]),
+                    "curr_fp": r["fingerprint"],
+                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
+                    "prev_fp": prev["fingerprint"],
+                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
+                }
+            )
+    return rows
+
 
 def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
     vehicles = sorted(vehicle_frames.keys())
@@ -430,29 +496,51 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     print(f"[Data] 训练样本数: {len(train_rows)} | 测试样本数: {len(test_rows)}")
 
+    signature = {
+        "train_vehicles": train_vehicles,
+        "train_rows": len(train_rows),
+        "split_mode": cfg.split_mode,
+        "train_vehicle_count": cfg.train_vehicle_count,
+        "test_vehicle_count": cfg.test_vehicle_count,
+    }
+    sig_path = os.path.join(output_dir, "trainset_signature.json")
+    model_path = os.path.join(output_dir, "global_pi_uae.pth")
+    scaler_path = os.path.join(output_dir, "global_scaler.npz")
+    can_reuse = False
+    if cfg.reuse_if_same_trainset and os.path.exists(sig_path) and os.path.exists(model_path) and os.path.exists(scaler_path):
+        with open(sig_path, "r", encoding="utf-8") as f:
+            old_sig = json.load(f)
+        can_reuse = old_sig == signature
+
     model = PIUAE().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
-    mse = nn.MSELoss()
-    for epoch in range(cfg.epochs):
-        model.train()
-        train_loss_sum = 0.0
-        train_steps = 0
-        for c_fp, c_sc, p_fp, p_sc, y, _, _ in train_loader:
-            c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
-            y_pred, recon = model(c_fp, c_sc)
-            y_prev, _ = model(p_fp, p_sc)
-            loss = mse(y_pred.squeeze(), y) + cfg.lambda_recon * mse(recon, c_fp) + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss_sum += float(loss.item())
-            train_steps += 1
+    if can_reuse:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("[Train] 训练集未变化，直接复用已有模型并跳过训练。")
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+        mse = nn.MSELoss()
+        for epoch in range(cfg.epochs):
+            model.train()
+            train_loss_sum = 0.0
+            train_steps = 0
+            for c_fp, c_sc, p_fp, p_sc, y, _, _ in train_loader:
+                c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
+                y_pred, recon = model(c_fp, c_sc)
+                y_prev, _ = model(p_fp, p_sc)
+                loss = mse(y_pred.squeeze(), y) + cfg.lambda_recon * mse(recon, c_fp) + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss_sum += float(loss.item())
+                train_steps += 1
 
-        if (epoch + 1) % max(1, cfg.log_every_epoch) == 0 or epoch == 0 or (epoch + 1) == cfg.epochs:
-            avg_loss = train_loss_sum / max(1, train_steps)
-            print(f"[Train] Epoch {epoch+1}/{cfg.epochs} | AvgLoss={avg_loss:.6f}")
+            if (epoch + 1) % max(1, cfg.log_every_epoch) == 0 or epoch == 0 or (epoch + 1) == cfg.epochs:
+                avg_loss = train_loss_sum / max(1, train_steps)
+                print(f"[Train] Epoch {epoch+1}/{cfg.epochs} | AvgLoss={avg_loss:.6f}")
 
-    torch.save(model.state_dict(), os.path.join(output_dir, "global_pi_uae.pth"))
+        torch.save(model.state_dict(), model_path)
+        with open(sig_path, "w", encoding="utf-8") as f:
+            json.dump(signature, f, ensure_ascii=False, indent=2)
 
     print(f"[Split] 训练车辆 {len(train_vehicles)}: {train_vehicles}")
     print(f"[Split] 测试车辆 {len(test_vehicles)}: {test_vehicles}")
@@ -530,15 +618,24 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
 
 
 def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict[str, pd.DataFrame]:
+    cache_dir = os.path.join(output_dir, "segment_cache")
+    os.makedirs(cache_dir, exist_ok=True)
     seg_by_vehicle: Dict[str, List[Dict]] = {}
     for i, f in enumerate(files, 1):
         veh_file = os.path.splitext(os.path.basename(f))[0]
         veh = normalize_vehicle_name(veh_file)
+        cache_path = os.path.join(cache_dir, f"{veh}.npz")
         try:
-            segs = extract_segments_from_file(f, cfg)
+            if cfg.use_segment_cache and (not cfg.refresh_segment_cache) and os.path.exists(cache_path):
+                segs = _load_segments_cache(cache_path)
+                print(f"[LoadCache] {i}/{len(files)} {veh_file} -> 片段数 {len(segs)}")
+            else:
+                segs = extract_segments_from_file(f, cfg)
+                if cfg.use_segment_cache:
+                    _save_segments_cache(cache_path, segs)
+                print(f"[Load] {i}/{len(files)} {veh_file} -> 片段数 {len(segs)}")
             if len(segs) > 0:
                 seg_by_vehicle.setdefault(veh, []).extend(segs)
-            print(f"[Load] {i}/{len(files)} {veh_file} -> 片段数 {len(segs)}")
         except Exception as e:
             print(f"[WARN] {veh_file} 处理失败: {e}")
 
@@ -568,6 +665,9 @@ def main() -> None:
     parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
     parser.add_argument("--read-chunk-size", type=int, default=200000, help="分块读取行数，内存不足时可调小")
     parser.add_argument("--log-every-epoch", type=int, default=10, help="每隔多少个epoch打印训练进度")
+    parser.add_argument("--no-segment-cache", action="store_true", help="不使用充电片段缓存")
+    parser.add_argument("--refresh-segment-cache", action="store_true", help="强制重建充电片段缓存")
+    parser.add_argument("--reuse-if-same-trainset", action="store_true", help="训练集不变时复用模型并跳过训练")
     args = parser.parse_args()
 
     cfg = Config(
@@ -580,6 +680,9 @@ def main() -> None:
         test_vehicle_count=args.test_vehicle_count,
         read_chunk_size=args.read_chunk_size,
         log_every_epoch=args.log_every_epoch,
+        use_segment_cache=(not args.no_segment_cache),
+        refresh_segment_cache=args.refresh_segment_cache,
+        reuse_if_same_trainset=args.reuse_if_same_trainset,
     )
     set_seed(cfg.seed)
 
