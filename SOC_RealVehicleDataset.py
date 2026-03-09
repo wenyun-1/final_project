@@ -5,7 +5,7 @@ import numpy as np
 import gc # 垃圾回收
 
 class RealVehicleDataset(Dataset):
-    def __init__(self, csv_file_path, window_size=30, sample_stride=10, is_train=True):
+    def __init__(self, csv_file_path, window_size=30, sample_stride=10, is_train=True, discharge_only=True):
         """
         :param sample_stride: 采样步长。
         """
@@ -23,9 +23,14 @@ class RealVehicleDataset(Dataset):
         required_cols = ['Current', 'Voltage', 'Temperature', 'SOC', 'SOH']
         
         try:
-            reader = pd.read_csv(csv_file_path, usecols=required_cols, dtype='float32', chunksize=chunk_size)
+            reader = pd.read_csv(csv_file_path, chunksize=chunk_size)
             
             for i, chunk in enumerate(reader):
+                missing = [c for c in required_cols if c not in chunk.columns]
+                if missing:
+                    raise KeyError(f"输入数据缺少列: {missing}")
+                chunk = chunk[required_cols].copy()
+
                 # 1. 立即降采样：在这一小块数据中，每隔 stride 取一行
                 sampled_chunk = chunk.iloc[::sample_stride]
                 
@@ -49,6 +54,11 @@ class RealVehicleDataset(Dataset):
         # 主动释放切片列表内存
         del chunks_list
         gc.collect()
+
+        if discharge_only:
+            before = len(df)
+            df = df[df['Current'] > 0].copy()
+            print(f"Dataset: 放电过滤已启用，保留 {len(df)}/{before} 行 (Current>0)")
 
         # === 归一化 (逻辑不变) ===
         # 电流: 假设 -500 ~ 500
@@ -79,7 +89,7 @@ class RealVehicleDataset(Dataset):
         gc.collect()
 
     def __len__(self):
-        return len(self.x_data) - self.window
+        return max(0, len(self.x_data) - self.window)
 
     def __getitem__(self, index):
         x_realtime = self.x_data[index : index + self.window]
