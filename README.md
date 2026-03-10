@@ -92,10 +92,10 @@ python soh_compare_experiments.py \
   --output-root outputs_compare
 ```
 
-该脚本会自动生成三组结果：
-- `baseline`：保留当前配置；
-- `alt_split`：只替换测试车辆；
-- `alt_pseudo`：同一车辆划分下替换伪标签方式；
+该脚本会自动生成三组结果（严格控制变量）：
+- `baseline`：当前划分 + `robust_linear`；
+- `alt_split`：仅更换 train/test 车辆划分，伪标签方法保持 `robust_linear` 不变；
+- `alt_pseudo`：仅更换伪标签方法，train/test 划分与 `baseline` 完全一致；
 
 并输出 `outputs_compare/comparison_metrics.csv` 和 `outputs_compare/comparison_metrics.png` 便于横向对比。
 

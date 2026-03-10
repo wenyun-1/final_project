@@ -1,6 +1,7 @@
-"""对比实验脚本：
-1) 保留当前伪标签策略，替换 train/test 车辆
-2) 保持同一 split，替换伪标签策略
+"""对比实验脚本（严格控制变量版）：
+1) baseline：当前划分 + 当前伪标签
+2) alt_split：仅替换 train/test 车辆划分（与 baseline 方法相同）
+3) alt_pseudo：仅替换伪标签方法（与 baseline 划分完全一致）
 """
 
 from __future__ import annotations
@@ -24,16 +25,43 @@ from soh_final_pipeline import (
 )
 
 
-def _choose_alt_test_vehicles(available: List[str], baseline: List[str], n_test: int) -> List[str]:
-    baseline_set = set(baseline)
+def _choose_alt_test_vehicles(available: List[str], baseline_test: List[str], n_test: int) -> List[str]:
+    baseline_set = set(baseline_test)
     candidates = [v for v in available if v not in baseline_set]
-    if len(candidates) >= n_test:
-        return sorted(candidates[:n_test])
+    if len(candidates) < n_test:
+        raise ValueError(
+            f"无法自动构造完全不同的测试集：需要 {n_test} 辆非baseline测试车，当前仅 {len(candidates)} 辆。"
+        )
+    return sorted(candidates[:n_test])
 
-    rotated = [v for v in available if v in baseline_set] + candidates
-    if len(rotated) < n_test:
-        raise ValueError(f"可用车辆不足，无法构造替代测试集（需要{n_test}辆，当前{len(available)}辆）。")
-    return sorted(rotated[:n_test])
+
+def _resolve_split(
+    available: List[str],
+    baseline_test: List[str],
+    test_count: int,
+    alt_test_vehicles: List[str] | None,
+) -> tuple[List[str], List[str]]:
+    available_set = set(available)
+    baseline_test_set = set(baseline_test)
+
+    if alt_test_vehicles:
+        alt_test = sorted([normalize_vehicle_name(v) for v in alt_test_vehicles])
+    else:
+        alt_test = _choose_alt_test_vehicles(available, baseline_test, test_count)
+
+    if len(alt_test) != test_count:
+        raise ValueError(f"alt_test 数量必须为 {test_count}，当前为 {len(alt_test)}")
+    if any(v not in available_set for v in alt_test):
+        miss = [v for v in alt_test if v not in available_set]
+        raise ValueError(f"alt_test 中存在无效车辆: {miss}")
+
+    # 强控制变量：alt_split 必须与 baseline 测试集不同
+    if set(alt_test) == baseline_test_set:
+        raise ValueError("alt_split 的测试集与 baseline 完全相同，不构成有效对比")
+
+    alt_train = sorted([v for v in available if v not in set(alt_test)])
+    return alt_train, alt_test
+
 
 
 def _run_one(name: str, cfg: Config, files: List[str], output_root: str) -> pd.DataFrame:
@@ -88,15 +116,17 @@ def _plot_compare(df: pd.DataFrame, out_png: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SOH对比实验：换split + 换伪标签")
+    parser = argparse.ArgumentParser(description="SOH对比实验：换split + 换伪标签（控制变量）")
     parser.add_argument("--output-root", default="outputs_compare")
     parser.add_argument("--data-dirs", nargs="+", default=["data"])
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smooth-window", type=int, default=15)
     parser.add_argument("--read-chunk-size", type=int, default=200000)
+
     parser.add_argument("--baseline-test-vehicles", nargs="*", default=["LFP604EV3", "LFP604EV10", "LFP604EV9"])
-    parser.add_argument("--alt-test-vehicles", nargs="*", default=None)
+    parser.add_argument("--alt-test-vehicles", nargs="*", default=None, help="alt_split 的测试车辆（可选）")
+
     parser.add_argument("--alt-pseudo-method", choices=["rolling_monotone", "isotonic_monotone"], default="isotonic_monotone")
     args = parser.parse_args()
 
@@ -105,6 +135,7 @@ def main() -> None:
     if not files:
         raise FileNotFoundError(f"未找到CSV数据，请检查目录: {args.data_dirs}")
 
+    baseline_test = [normalize_vehicle_name(v) for v in args.baseline_test_vehicles]
     base_cfg = Config(
         epochs=args.epochs,
         seed=args.seed,
@@ -112,7 +143,7 @@ def main() -> None:
         split_mode="cross_vehicle",
         train_vehicle_count=9,
         test_vehicle_count=3,
-        fixed_test_vehicles=[normalize_vehicle_name(v) for v in args.baseline_test_vehicles],
+        fixed_test_vehicles=baseline_test,
         read_chunk_size=args.read_chunk_size,
         pseudo_label_method="robust_linear",
     )
@@ -120,35 +151,46 @@ def main() -> None:
 
     baseline_metrics = _run_one("baseline", base_cfg, files, args.output_root)
 
-    baseline_frames = build_vehicle_frames(files, base_cfg, os.path.join(args.output_root, "_probe"))
-    all_vehicles = sorted(baseline_frames.keys())
-    n_test = len(base_cfg.fixed_test_vehicles)
+    probe_frames = build_vehicle_frames(files, base_cfg, os.path.join(args.output_root, "_probe"))
+    all_vehicles = sorted(probe_frames.keys())
 
-    if args.alt_test_vehicles:
-        alt_test = [normalize_vehicle_name(v) for v in args.alt_test_vehicles]
-    else:
-        alt_test = _choose_alt_test_vehicles(all_vehicles, base_cfg.fixed_test_vehicles, n_test)
+    alt_train, alt_test = _resolve_split(
+        available=all_vehicles,
+        baseline_test=baseline_test,
+        test_count=base_cfg.test_vehicle_count,
+        alt_test_vehicles=args.alt_test_vehicles,
+    )
 
     split_cfg = copy.deepcopy(base_cfg)
     split_cfg.fixed_test_vehicles = alt_test
+    split_cfg.train_vehicle_count = len(alt_train)
+    split_cfg.test_vehicle_count = len(alt_test)
     split_cfg.reuse_if_same_trainset = False
     split_metrics = _run_one("alt_split", split_cfg, files, args.output_root)
 
     pseudo_cfg = copy.deepcopy(base_cfg)
+    # 强控制变量：伪标签对比沿用 baseline 同一划分
+    pseudo_cfg.fixed_test_vehicles = baseline_test
+    pseudo_cfg.train_vehicle_count = base_cfg.train_vehicle_count
+    pseudo_cfg.test_vehicle_count = base_cfg.test_vehicle_count
     pseudo_cfg.pseudo_label_method = args.alt_pseudo_method
     pseudo_cfg.reuse_if_same_trainset = False
     pseudo_metrics = _run_one("alt_pseudo", pseudo_cfg, files, args.output_root)
 
     rows = [
-        _summarize(baseline_metrics, "baseline", f"test={base_cfg.fixed_test_vehicles}", base_cfg.pseudo_label_method),
-        _summarize(split_metrics, "alt_split", f"test={alt_test}", split_cfg.pseudo_label_method),
-        _summarize(pseudo_metrics, "alt_pseudo", f"test={base_cfg.fixed_test_vehicles}", pseudo_cfg.pseudo_label_method),
+        _summarize(baseline_metrics, "baseline", f"test={baseline_test}", base_cfg.pseudo_label_method),
+        _summarize(split_metrics, "alt_split", f"train={alt_train}; test={alt_test}", split_cfg.pseudo_label_method),
+        _summarize(pseudo_metrics, "alt_pseudo", f"test={baseline_test}", pseudo_cfg.pseudo_label_method),
     ]
     cmp_df = pd.DataFrame(rows)
     cmp_csv = os.path.join(args.output_root, "comparison_metrics.csv")
     cmp_df.to_csv(cmp_csv, index=False)
     _plot_compare(cmp_df, os.path.join(args.output_root, "comparison_metrics.png"))
-    print("✅ 对比实验完成：")
+
+    print("✅ 对比实验完成（控制变量）:")
+    print(f"- baseline split(test): {baseline_test}")
+    print(f"- alt_split train/test: {alt_train} / {alt_test}")
+    print(f"- alt_pseudo method: {args.alt_pseudo_method} (split 与 baseline 一致)")
     print(f"- {cmp_csv}")
     print(f"- {os.path.join(args.output_root, 'comparison_metrics.png')}")
 
