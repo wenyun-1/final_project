@@ -17,17 +17,37 @@ GAP_THRESHOLD_SEC = 1800
 SOH_BASE_DATE = "2020-01-01"
 INITIAL_SOH_POLICY = "drop_until_first_valid"  # "drop_until_first_valid" 或 "fill_default"
 DEFAULT_INITIAL_SOH = 1.0
+VEHICLE_SPLIT_FILE = "outputs_final/vehicle_split.csv"
+READ_CHUNK_SIZE = 200000
 # ===========================================================
 
 
 def _normalize_vehicle_key(name):
     if not isinstance(name, str):
         return ""
-    s = name.strip()
-    m = re.search(r'(EV\d+)', s, flags=re.IGNORECASE)
+    s = name.strip().upper()
+    m = re.search(r'(LFP\d+EV\d+)', s, flags=re.IGNORECASE)
     if m:
         return m.group(1).upper()
-    return s.upper()
+    return s
+
+
+def _load_allowed_vehicle_keys(split_file, split_role):
+    if not split_file:
+        return None
+    if not os.path.exists(split_file):
+        raise FileNotFoundError(f"找不到 vehicle_split 文件: {split_file}")
+    split_df = pd.read_csv(split_file)
+    if not {"Vehicle", "Role"}.issubset(split_df.columns):
+        raise KeyError("vehicle_split.csv 需要包含 Vehicle, Role 两列。")
+    if split_role not in {"train", "test", "all"}:
+        raise ValueError("split_role 仅支持 train/test/all")
+    if split_role == "all":
+        target = split_df.copy()
+    else:
+        target = split_df[split_df["Role"].astype(str).str.lower() == split_role].copy()
+    keys = {_normalize_vehicle_key(v) for v in target["Vehicle"].astype(str).tolist()}
+    return keys
 
 
 def _resolve_vehicle_rows(soh_mapping_df, veh_name):
@@ -103,77 +123,106 @@ def process_integrated(args):
         raise KeyError("SOH 映射文件缺少 Vehicle 列。")
 
     global_cycle_offset = 0
+    has_written = False
+    allowed_keys = _load_allowed_vehicle_keys(args.vehicle_split_file, args.split_role)
 
     for i, file_path in enumerate(csv_files):
         file_name = os.path.basename(file_path)
         veh_name = file_name.split('.')[0]
+        veh_key = _normalize_vehicle_key(veh_name)
+        if allowed_keys is not None and veh_key not in allowed_keys:
+            print(f"\n>>> [{i+1}/{len(csv_files)}] 跳过: {veh_name} (不在 {args.split_role} 列表)")
+            continue
         print(f"\n>>> [{i+1}/{len(csv_files)}] 正在处理: {veh_name}")
 
         try:
-            try:
-                df = pd.read_csv(file_path, encoding='gbk', usecols=USE_COLS, low_memory=False)
-            except Exception:
-                df = pd.read_csv(file_path, encoding='utf-8', usecols=USE_COLS, low_memory=False)
-
-            for col in ['totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'], errors='coerce')
-            df = df.dropna(subset=['DATA_TIME', 'totalVoltage'])
-            df = df[df['totalVoltage'] > args.min_valid_voltage].copy()
-            df = df.sort_values('DATA_TIME').reset_index(drop=True)
-            if len(df) == 0:
-                continue
-
-            df['time_diff'] = df['DATA_TIME'].diff().dt.total_seconds().fillna(0)
-            internal_cycle_ids = (df['time_diff'] > args.gap_threshold_sec).astype(int).cumsum() + 1
-            df['Cycle_ID'] = internal_cycle_ids + global_cycle_offset
-            global_cycle_offset = df['Cycle_ID'].max()
-
             veh_soh_trajectory = _prepare_soh_trajectory(soh_mapping, veh_name, args.soh_base_date)
             if len(veh_soh_trajectory) > 0:
-                df = pd.merge_asof(
-                    df,
-                    veh_soh_trajectory,
-                    left_on='DATA_TIME',
-                    right_on='SOH_TIME',
-                    direction='backward',
-                    allow_exact_matches=True,
-                )
-                df['SOH'] = df['Pred_SOH']
+                print("    ✅ 已加载该车 SOH 轨迹，开始分块注入...")
+            else:
+                print(f"    ⚠️ 无该车 SOH 轨迹，分块默认填充 SOH={args.default_initial_soh:.3f}")
 
-                if args.initial_soh_policy == 'fill_default':
-                    df['SOH'] = df['SOH'].fillna(args.default_initial_soh)
-                elif args.initial_soh_policy == 'drop_until_first_valid':
-                    df = df[df['SOH'].notna()].copy()
+            try:
+                reader = pd.read_csv(file_path, encoding='gbk', usecols=USE_COLS, low_memory=False, chunksize=args.read_chunk_size)
+            except Exception:
+                reader = pd.read_csv(file_path, encoding='utf-8', usecols=USE_COLS, low_memory=False, chunksize=args.read_chunk_size)
+
+            cur_cycle = global_cycle_offset + 1
+            prev_time = None
+            kept_rows = 0
+
+            for chunk_idx, df in enumerate(reader, 1):
+                for col in ['totalVoltage', 'totalCurrent', 'maxTemperature', 'minTemperature', 'SOC']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+                df['DATA_TIME'] = pd.to_datetime(df['DATA_TIME'], errors='coerce')
+                df = df.dropna(subset=['DATA_TIME', 'totalVoltage'])
+                df = df[df['totalVoltage'] > args.min_valid_voltage].copy()
+                if len(df) == 0:
+                    continue
+                df = df.sort_values('DATA_TIME').reset_index(drop=True)
+
+                if prev_time is None:
+                    first_gap = 0.0
                 else:
-                    raise ValueError(f"未知 initial_soh_policy: {args.initial_soh_policy}")
+                    first_gap = (df['DATA_TIME'].iloc[0] - prev_time).total_seconds()
+
+                td = df['DATA_TIME'].diff().dt.total_seconds()
+                td.iloc[0] = first_gap
+                td = td.fillna(0)
+                cycle_inc = (td > args.gap_threshold_sec).astype(int).cumsum()
+                df['Cycle_ID'] = (cur_cycle + cycle_inc).astype('float32')
+                cur_cycle = int(df['Cycle_ID'].iloc[-1])
+                prev_time = df['DATA_TIME'].iloc[-1]
+
+                if len(veh_soh_trajectory) > 0:
+                    df = pd.merge_asof(
+                        df,
+                        veh_soh_trajectory,
+                        left_on='DATA_TIME',
+                        right_on='SOH_TIME',
+                        direction='backward',
+                        allow_exact_matches=True,
+                    )
+                    df['SOH'] = df['Pred_SOH']
+                    if args.initial_soh_policy == 'fill_default':
+                        df['SOH'] = df['SOH'].fillna(args.default_initial_soh)
+                    elif args.initial_soh_policy == 'drop_until_first_valid':
+                        df = df[df['SOH'].notna()].copy()
+                    else:
+                        raise ValueError(f"未知 initial_soh_policy: {args.initial_soh_policy}")
+                else:
+                    df['SOH'] = args.default_initial_soh
 
                 if len(df) == 0:
-                    print("    ⚠️ 当前文件所有数据都早于首个有效 SOH 更新点，已跳过。")
                     continue
 
-                print(f"    ✅ 已按前向保持注入 SOH（backward asof），SOH 范围: {df['SOH'].min():.3f} ~ {df['SOH'].max():.3f}")
-            else:
-                df['SOH'] = args.default_initial_soh
-                print(f"    ⚠️ 无该车 SOH 轨迹，已默认填充 SOH={args.default_initial_soh:.3f}")
+                temp_mean = ((df['maxTemperature'] + df['minTemperature']) / 2).ffill()
+                final_df = pd.DataFrame({
+                    'Vehicle': veh_key,
+                    'Current': df['totalCurrent'],
+                    'Voltage': df['totalVoltage'],
+                    'Temperature': temp_mean,
+                    'SOC': df['SOC'],
+                    'Cycle_ID': df['Cycle_ID'],
+                    'SOH': df['SOH'],
+                })
+                for c in ['Current', 'Voltage', 'Temperature', 'SOC', 'Cycle_ID', 'SOH']:
+                    final_df[c] = pd.to_numeric(final_df[c], errors='coerce').astype('float32')
 
-            temp_mean = ((df['maxTemperature'] + df['minTemperature']) / 2).ffill()
-            final_df = pd.DataFrame({
-                'Current': df['totalCurrent'],
-                'Voltage': df['totalVoltage'],
-                'Temperature': temp_mean,
-                'SOC': df['SOC'],
-                'Cycle_ID': df['Cycle_ID'],
-                'SOH': df['SOH'],
-            }).astype('float32')
+                final_df.to_csv(args.output_csv, mode='a', index=False, header=(not has_written))
+                has_written = True
+                kept_rows += len(final_df)
 
-            write_header = (i == 0)
-            final_df.to_csv(args.output_csv, mode='a', index=False, header=write_header)
+                if chunk_idx % 5 == 0:
+                    print(f"    ...分块进度 chunk={chunk_idx}, 累计写入={kept_rows}")
 
-            del df
-            del final_df
-            gc.collect()
+                del df
+                del final_df
+                gc.collect()
+
+            global_cycle_offset = cur_cycle
+            print(f"    ✅ 文件完成，累计有效写入 {kept_rows} 行")
         except Exception as e:
             print(f"    ❌ 处理出错: {e}")
 
@@ -195,6 +244,9 @@ def build_args():
         help='首个有效 SOH 更新前数据处理策略',
     )
     parser.add_argument('--default-initial-soh', type=float, default=DEFAULT_INITIAL_SOH, help='默认 SOH 值')
+    parser.add_argument('--vehicle-split-file', default=VEHICLE_SPLIT_FILE, help='SOH阶段输出的车辆划分文件；留空表示不过滤车辆')
+    parser.add_argument('--split-role', default='train', choices=['train', 'test', 'all'], help='根据划分文件选择处理哪些车辆')
+    parser.add_argument('--read-chunk-size', type=int, default=READ_CHUNK_SIZE, help='分块读取行数，内存不足时调小')
     return parser.parse_args()
 
 
