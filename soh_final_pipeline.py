@@ -485,7 +485,9 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     np.savez(os.path.join(output_dir, "global_scaler.npz"), mean=mean, std=std)
 
     train_ds = SOHDataset(train_rows, mean=mean, std=std)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    if len(train_ds) < 2:
+        raise ValueError("训练样本不足（<2），BatchNorm 无法稳定训练。")
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     print(f"[Data] 训练样本数: {len(train_rows)} | 测试样本数: {len(test_rows)}")
 
     signature = {
