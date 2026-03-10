@@ -42,14 +42,15 @@ def _load_chapter3_curve_data(soh_output: str) -> Dict[str, pd.DataFrame]:
     points_csv = os.path.join(soh_output, "soh_predictions_points.csv")
     if os.path.exists(points_csv):
         df = pd.read_csv(points_csv)
-        required = {"Vehicle", "Days", "SOH_true", "SOH_pred_filtered"}
+        required = {"Vehicle", "Days", "SOH_true", "SOH_pred_raw", "SOH_pred_filtered"}
         if required.issubset(df.columns):
             veh_data: Dict[str, pd.DataFrame] = {}
             for veh, g in df.groupby("Vehicle"):
                 gg = g.sort_values("Days").copy()
                 gg["SOH_true"] = pd.to_numeric(gg["SOH_true"], errors="coerce")
+                gg["SOH_pred_raw"] = pd.to_numeric(gg["SOH_pred_raw"], errors="coerce")
                 gg["SOH_pred"] = pd.to_numeric(gg["SOH_pred_filtered"], errors="coerce")
-                veh_data[str(veh)] = gg[["Days", "SOH_true", "SOH_pred"]].dropna()
+                veh_data[str(veh)] = gg[["Days", "SOH_true", "SOH_pred_raw", "SOH_pred"]].dropna()
             return veh_data
 
     pred_csv = os.path.join(soh_output, "SOH_Predictions_For_SOC.csv")
@@ -107,10 +108,12 @@ def plot_chapter3_subplot(soh_output: str, out_dir: str) -> Optional[str]:
         ax = axes_arr[i]
         g = veh_data[veh].sort_values("Days")
 
-        if g["SOH_true"].notna().any():
+        if "SOH_pred_raw" in g.columns and g["SOH_pred_raw"].notna().any():
+            ax.scatter(g["Days"], g["SOH_pred_raw"], s=14, c="#4e79a7", alpha=0.55, label="Estimated points")
+        elif g["SOH_true"].notna().any():
             ax.scatter(g["Days"], g["SOH_true"], s=14, c="black", alpha=0.65, label="True SOH")
 
-        ax.plot(g["Days"], g["SOH_pred"], color="#e15759", lw=2.2, alpha=0.95, label="Predicted SOH")
+        ax.plot(g["Days"], g["SOH_pred"], color="#e15759", lw=2.2, alpha=0.95, label="SOH degradation trend")
 
         m = metrics.get(veh, {})
         rmse = m.get("RMSE_filtered", np.nan)
