@@ -15,6 +15,10 @@ __pycache__/
 # 运行输出目录
 outputs_ablation/
 outputs_final/
+*.pth
+*.png
+outputs_*/
+figures/generated/
 
 # 常见缓存/临时
 *.log
