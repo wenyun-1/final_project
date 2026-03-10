@@ -51,6 +51,22 @@ python soh_final_pipeline.py --data-dirs data --refresh-segment-cache
 python soh_final_pipeline.py --data-dirs data --no-segment-cache
 ```
 
+### 伪标签方式切换（用于对比“线性过硬”问题）
+
+默认是 `robust_linear`（与旧结果一致）。可尝试：
+
+- `rolling_monotone`：滚动中位数 + 单调下降约束；
+- `isotonic_monotone`：保序回归（非线性，但保证整体不升）。
+
+示例：
+
+```bash
+python soh_final_pipeline.py \
+  --data-dirs data \
+  --pseudo-label-method isotonic_monotone \
+  --output outputs_final_iso
+```
+
 ### 训练集不变时的快速运行（跳过训练）
 
 新增脚本：`soh_run_reuse.py`
@@ -62,6 +78,26 @@ python soh_run_reuse.py --data-dirs data --output outputs_final
 机制说明：
 - 若检测到训练车辆集合和样本规模未变化，且 `global_pi_uae.pth` 已存在，则直接复用模型并跳过训练；
 - 若训练集发生变化，则自动重新训练并更新模型。
+
+### 一次性做“两组对比实验”
+
+新增脚本：`soh_compare_experiments.py`
+
+```bash
+python soh_compare_experiments.py \
+  --data-dirs data \
+  --baseline-test-vehicles LFP604EV3 LFP604EV10 LFP604EV9 \
+  --alt-test-vehicles LFP604EV1 LFP604EV2 LFP604EV4 \
+  --alt-pseudo-method isotonic_monotone \
+  --output-root outputs_compare
+```
+
+该脚本会自动生成三组结果（严格控制变量）：
+- `baseline`：当前划分 + `robust_linear`；
+- `alt_split`：仅更换 train/test 车辆划分，伪标签方法保持 `robust_linear` 不变；
+- `alt_pseudo`：仅更换伪标签方法，train/test 划分与 `baseline` 完全一致；
+
+并输出 `outputs_compare/comparison_metrics.csv` 和 `outputs_compare/comparison_metrics.png` 便于横向对比。
 
 ### 说明
 

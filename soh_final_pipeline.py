@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.interpolate import interp1d
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.isotonic import IsotonicRegression
 from torch.utils.data import DataLoader, Dataset
 
 TIME_FORMAT = "mixed"
@@ -61,6 +62,7 @@ class Config:
     use_segment_cache: bool = True
     refresh_segment_cache: bool = False
     reuse_if_same_trainset: bool = False
+    pseudo_label_method: str = "robust_linear"
 
 
 def set_seed(seed: int) -> None:
@@ -253,7 +255,7 @@ def _load_segments_cache(path: str) -> List[Dict]:
     return out
 
 
-def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.DataFrame:
+def build_pseudo_labels(rows: List[Dict], method: str = "robust_linear") -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -266,10 +268,10 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
     n_head = max(5, int(len(df) * 0.2))
     baseline_cap = float(np.percentile(df["raw_cap_clip"].iloc[:n_head], 85))
 
-    # 一阶拟合抽取“本征衰减主趋势”
+    # 伪标签趋势抽取：支持多种方法，便于做“同 split 下只替换伪标签策略”的对比实验
     days = df["days"].to_numpy(dtype=float)
     raw_cap_clip = df["raw_cap_clip"].to_numpy(dtype=float)
-    if robust_linear:
+    if method == "robust_linear":
         # 先做中心化，降低病态拟合概率；同时约束衰减斜率不为正
         if np.unique(days).size >= 2:
             x = days - days.mean()
@@ -285,8 +287,21 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
                 trend_cap = np.minimum.accumulate(trend_cap)
         else:
             trend_cap = np.full_like(raw_cap_clip, float(np.median(raw_cap_clip)))
+    elif method == "rolling_monotone":
+        trend_cap = pd.Series(raw_cap_clip).rolling(window=9, min_periods=1, center=True).median().values
+        trend_cap = np.minimum.accumulate(trend_cap)
+    elif method == "isotonic_monotone":
+        if np.unique(days).size >= 2:
+            try:
+                ir = IsotonicRegression(increasing=False, out_of_bounds="clip")
+                trend_cap = ir.fit_transform(days, raw_cap_clip)
+            except Exception:
+                trend_cap = pd.Series(raw_cap_clip).rolling(window=9, min_periods=1, center=True).median().values
+                trend_cap = np.minimum.accumulate(trend_cap)
+        else:
+            trend_cap = np.full_like(raw_cap_clip, float(np.median(raw_cap_clip)))
     else:
-        trend_cap = raw_cap_clip
+        raise ValueError(f"未知伪标签方法: {method}")
 
     soh_true = (trend_cap / baseline_cap) * 100.0
     soh_true = np.clip(soh_true, 0.0, 100.0)
@@ -366,6 +381,33 @@ class SOHDataset(Dataset):
             r["days"],
             r["Vehicle"],
         )
+
+    test_vehicles = sorted(shuffled[:n_test])
+    remain = [v for v in shuffled if v not in set(test_vehicles)]
+    remain = remain[:n_train]
+    train_vehicles = sorted(remain)
+    return train_vehicles, test_vehicles
+
+
+def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
+    rows: List[Dict] = []
+    for veh in vehicles:
+        frame = vehicle_frames[veh].sort_values("days").reset_index(drop=True)
+        records = frame.to_dict("records")
+        for i, r in enumerate(records):
+            prev = records[i - 1] if i > 0 else records[i]
+            rows.append(
+                {
+                    "Vehicle": veh,
+                    "days": int(r["days"]),
+                    "soh_true": float(r["soh_true"]),
+                    "curr_fp": r["fingerprint"],
+                    "curr_sc_raw": [float(r["avg_curr"]), float(r["avg_temp"])],
+                    "prev_fp": prev["fingerprint"],
+                    "prev_sc_raw": [float(prev["avg_curr"]), float(prev["avg_temp"])],
+                }
+            )
+    return rows
 
 
 def split_vehicles(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config) -> Tuple[List[str], List[str]]:
@@ -679,7 +721,7 @@ def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict
 
     frames: Dict[str, pd.DataFrame] = {}
     for veh, segs in seg_by_vehicle.items():
-        labeled = build_pseudo_labels(segs, robust_linear=True)
+        labeled = build_pseudo_labels(segs, method=cfg.pseudo_label_method)
         if labeled.empty:
             continue
         frames[veh] = labeled
@@ -707,6 +749,12 @@ def main() -> None:
     parser.add_argument("--no-segment-cache", action="store_true", help="不使用充电片段缓存")
     parser.add_argument("--refresh-segment-cache", action="store_true", help="强制重建充电片段缓存")
     parser.add_argument("--reuse-if-same-trainset", action="store_true", help="训练集不变时复用模型并跳过训练")
+    parser.add_argument(
+        "--pseudo-label-method",
+        choices=["robust_linear", "rolling_monotone", "isotonic_monotone"],
+        default="robust_linear",
+        help="伪标签生成方式：robust_linear(原始)、rolling_monotone(滚动+单调约束)、isotonic_monotone(保序回归)",
+    )
     args = parser.parse_args()
 
     cfg = Config(
@@ -723,6 +771,7 @@ def main() -> None:
         use_segment_cache=(not args.no_segment_cache),
         refresh_segment_cache=args.refresh_segment_cache,
         reuse_if_same_trainset=args.reuse_if_same_trainset,
+        pseudo_label_method=args.pseudo_label_method,
     )
     set_seed(cfg.seed)
 
