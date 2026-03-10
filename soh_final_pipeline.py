@@ -82,8 +82,15 @@ def sanity_check_source_structure() -> None:
         src = inspect.getsource(inspect.getmodule(sanity_check_source_structure))
     except Exception:
         return
-    dup_targets = ["def split_vehicles(", "def build_rows_for_vehicles("]
-    bad = {k: src.count(k) for k in dup_targets if src.count(k) > 1}
+    checks = {
+        "split_vehicles": r"^def\s+split_vehicles\(",
+        "build_rows_for_vehicles": r"^def\s+build_rows_for_vehicles\(",
+    }
+    bad = {}
+    for name, pattern in checks.items():
+        cnt = len(re.findall(pattern, src, flags=re.MULTILINE))
+        if cnt > 1:
+            bad[name] = cnt
     if bad:
         raise RuntimeError(
             f"检测到代码冲突残留（重复定义）: {bad}。请用仓库最新版覆盖本地 soh_final_pipeline.py。"
