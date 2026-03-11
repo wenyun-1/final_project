@@ -1,7 +1,7 @@
-"""SOH 终极路线：单脚本可复现实验管线（加入定期校准伪标签）
+"""SOH 终极路线：单脚本可复现实验管线（7天检修真值注入）
 
 核心思想：
-1) 伪标签：新增 periodic_calibration（模拟实车每隔半年的高精度保养校准）
+1) 伪标签：采用 weekly_inspection（模拟每7天检修）
 2) 模型：提升了物理惩罚系数 (alpha_physics=1.0)，强迫模型学习真正的退化趋势，拒绝随温度震荡
 3) 评估：自动按方法分目录导出结果，直接生成 SOC 接口文件
 """
@@ -53,17 +53,15 @@ class Config:
     min_soc_delta: float = 20.0
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
-    train_vehicle_count: int = 9
-    test_vehicle_count: int = 3
+    train_vehicle_count: int = 10
+    test_vehicle_count: int = 2
     # 固定测试集
-    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV3", "LFP604EV10", "LFP604EV9"])
+    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV11", "LFP604EV12"])
     read_chunk_size: int = 200000
     use_segment_cache: bool = True
     refresh_segment_cache: bool = False
     
-    # 【新增参数】：实车定期保养校准周期（天）
-    calib_interval_days: int = 180
-    # [7-DAY ITERATION] 7天检修周期（保留calib_interval_days用于对比）
+    # [7-DAY ITERATION] 7天检修周期
     inspect_interval_days: int = 7
     # [7-DAY ITERATION] 真值注入模式：none / weekly
     truth_injection_mode: str = "weekly"
@@ -218,48 +216,8 @@ def build_pseudo_labels(rows: List[Dict], method: str, cfg: Config = Config()) -
     # [7-DAY ITERATION] 预置真值掩码（默认无真值注入）
     df["truth_mask"] = False
 
-    # 【核心修改 2】：全新的定期标定伪标签逻辑
-    if method == "periodic_calibration":
-        anchor_days = []
-        anchor_caps = []
-        min_day, max_day = int(np.min(days)), int(np.max(days))
-        
-        # 1. 强制记录初始健康状态
-        anchor_days.append(min_day)
-        anchor_caps.append(np.percentile(raw_cap_clip[:max(5, len(raw_cap_clip)//20)], 85))
-        
-        # 2. 模拟每隔 180 天进行一次高精度保养测试
-        interval = cfg.calib_interval_days
-        for d in range(min_day + interval, max_day, interval):
-            # 取保养节点前后15天的数据中位数，模拟一次高置信度的容量测试
-            mask = (days >= d - 15) & (days <= d + 15)
-            if np.any(mask):
-                anchor_days.append(np.median(days[mask]))
-                anchor_caps.append(np.median(raw_cap_clip[mask]))
-                
-        # 3. 强制记录当前(最后)健康状态
-        anchor_days.append(max_day)
-        anchor_caps.append(np.median(raw_cap_clip[-max(5, len(raw_cap_clip)//20):]))
-        
-        anchor_days = np.array(anchor_days)
-        anchor_caps = np.array(anchor_caps)
-        
-        # 物理常识约束：保养测出的容量不可能比半年前还高（强制单调非增）
-        anchor_caps = np.minimum.accumulate(anchor_caps)
-        
-        # 4. 利用 PCHIP 在稀疏的锚点之间平滑插值，补全日常日期的伪标签
-        unique_anchors, u_idx = np.unique(anchor_days, return_index=True)
-        if len(unique_anchors) >= 3:
-            pchip = PchipInterpolator(unique_anchors, anchor_caps[u_idx])
-            trend_cap = pchip(days)
-            trend_cap = np.minimum.accumulate(trend_cap)
-        else:
-            # 降级保护
-            trend_cap = pd.Series(raw_cap_clip).rolling(window=15, min_periods=1, center=True).median().values
-            trend_cap = np.minimum.accumulate(trend_cap)
-
-    # [7-DAY ITERATION] 双模式：按7天检修锚点生成趋势并导出真值日掩码
-    elif method == "weekly_inspection":
+    # [7-DAY ITERATION] 7天检修锚点生成趋势并导出真值日掩码
+    if method == "weekly_inspection":
         anchor_days = []
         anchor_caps = []
         min_day, max_day = int(np.min(days)), int(np.max(days))
@@ -466,7 +424,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         model.eval()
         days, y_true, y_pred = [], [], []
         with torch.no_grad():
-            for c_fp, c_sc, _, _, y, d, _ in test_loader:
+            for c_fp, c_sc, _, _, y, _, d, _ in test_loader:
                 p, _ = model(c_fp.to(device), c_sc.to(device))
                 y_pred.extend((p.cpu().numpy().flatten() * 100).tolist())
                 y_true.extend((y.numpy() * 100).tolist())
@@ -556,8 +514,8 @@ def simulate_weekly_inspection(vehicle_frames: Dict[str, pd.DataFrame], cfg: Con
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    # 默认跑你最新的“定期校准”思路，顺带跑一个平滑方法作对比
-    parser.add_argument("--pseudo-label-methods", nargs="+", default=["periodic_calibration", "weekly_inspection", "pchip_smooth"])
+    # 默认跑7天检修真值注入 + 平滑方法作对比
+    parser.add_argument("--pseudo-label-methods", nargs="+", default=["weekly_inspection", "pchip_smooth"])
     args = parser.parse_args()
 
     cfg = Config()
