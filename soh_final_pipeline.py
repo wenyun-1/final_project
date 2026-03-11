@@ -1,8 +1,8 @@
-"""SOH 终极路线：单脚本可复现实验管线（加入定期校准伪标签）
+"""SOH 终极路线：单脚本可复现实验管线（7天检修真值注入）
 
 核心思想：
-1) 伪标签：新增 periodic_calibration（模拟实车每隔半年的高精度保养校准）
-2) 模型：提升了物理惩罚系数 (alpha_physics=1.0)，强迫模型学习真正的退化趋势，拒绝随温度震荡
+1) 伪标签：采用 weekly_inspection（模拟每7天检修）
+2) 模型：提升了物理惩罚系数 (alpha_physics=2.0)，强迫模型学习真正的退化趋势，拒绝随温度震荡
 3) 评估：自动按方法分目录导出结果，直接生成 SOC 接口文件
 """
 
@@ -45,7 +45,7 @@ class Config:
     learning_rate: float = 5e-4
     lambda_recon: float = 0.5
     # 【核心修改 1】：加大了物理惩罚！如果红线还乱跳，就把这里改成 5.0
-    alpha_physics: float = 0.05
+    alpha_physics: float = 2.0
     smooth_window: int = 15
     seed: int = 42
     min_seg_points: int = 30
@@ -53,16 +53,24 @@ class Config:
     min_soc_delta: float = 20.0
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
-    train_vehicle_count: int = 9
-    test_vehicle_count: int = 3
+    train_vehicle_count: int = 10
+    test_vehicle_count: int = 2
     # 固定测试集
-    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV3", "LFP604EV10", "LFP604EV9"])
+    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV11", "LFP604EV12"])
     read_chunk_size: int = 200000
     use_segment_cache: bool = True
     refresh_segment_cache: bool = False
     
-    # 【新增参数】：实车定期保养校准周期（天）
-    calib_interval_days: int = 180 
+    # [7-DAY ITERATION] 7天检修周期
+    inspect_interval_days: int = 7
+    # [7-DAY ITERATION] 真值注入模式：none / weekly
+    truth_injection_mode: str = "weekly"
+    # [7-DAY ITERATION] 真值监督损失权重
+    truth_supervision_weight: float = 1.0
+    # [7-DAY ITERATION] 自洽监督损失权重
+    self_consistency_weight: float = 0.35
+    # [7-DAY ITERATION] 检修评估窗口长度（7天：第0天真值，后6天预测）
+    weekly_eval_horizon: int = 7
 
 
 def set_seed(seed: int) -> None:
@@ -205,58 +213,47 @@ def build_pseudo_labels(rows: List[Dict], method: str, cfg: Config = Config()) -
     days = df["days"].to_numpy(dtype=float)
     raw_cap_clip = df["raw_cap_clip"].to_numpy(dtype=float)
 
-    # 【核心修改 2】：全新的定期标定伪标签逻辑
-    if method == "periodic_calibration":
-        anchor_days = []
-        anchor_caps = []
-        min_day, max_day = int(np.min(days)), int(np.max(days))
-        
-        # 1. 强制记录初始健康状态
-        anchor_days.append(min_day)
-        anchor_caps.append(np.percentile(raw_cap_clip[:max(5, len(raw_cap_clip)//20)], 85))
-        
-        # 2. 模拟每隔 180 天进行一次高精度保养测试
-        interval = cfg.calib_interval_days
-        for d in range(min_day + interval, max_day, interval):
-            # 取保养节点前后15天的数据中位数，模拟一次高置信度的容量测试
-            mask = (days >= d - 15) & (days <= d + 15)
-            if np.any(mask):
-                anchor_days.append(np.median(days[mask]))
-                anchor_caps.append(np.median(raw_cap_clip[mask]))
-                
-        # 3. 强制记录当前(最后)健康状态
-        anchor_days.append(max_day)
-        anchor_caps.append(np.median(raw_cap_clip[-max(5, len(raw_cap_clip)//20):]))
-        
-        anchor_days = np.array(anchor_days)
-        anchor_caps = np.array(anchor_caps)
-        
-        # 物理常识约束：保养测出的容量不可能比半年前还高（强制单调非增）
-        anchor_caps = np.minimum.accumulate(anchor_caps)
-        
-        # 4. 利用 PCHIP 在稀疏的锚点之间平滑插值，补全日常日期的伪标签
-        unique_anchors, u_idx = np.unique(anchor_days, return_index=True)
-        if len(unique_anchors) >= 3:
-            pchip = PchipInterpolator(unique_anchors, anchor_caps[u_idx])
+    # [7-DAY ITERATION] 预置真值掩码（默认无真值注入）
+    df["truth_mask"] = False
+
+    # [7-DAY ITERATION] 使用较大窗口平滑 + 保序回归，避免阶梯状死区
+    smooth_window = 21
+    rolling_median = pd.Series(raw_cap_clip).rolling(window=smooth_window, center=True, min_periods=1).median().bfill().ffill().to_numpy()
+    iso = IsotonicRegression(increasing=False)
+    monotone_fit = iso.fit_transform(days, rolling_median)
+
+    if method == "weekly_inspection":
+        unique_days, indices = np.unique(days, return_index=True)
+        unique_monotone = monotone_fit[indices]
+        if len(unique_days) >= 3:
+            pchip = PchipInterpolator(unique_days, unique_monotone)
             trend_cap = pchip(days)
-            trend_cap = np.minimum.accumulate(trend_cap)
         else:
-            # 降级保护
-            trend_cap = pd.Series(raw_cap_clip).rolling(window=15, min_periods=1, center=True).median().values
-            trend_cap = np.minimum.accumulate(trend_cap)
+            trend_cap = monotone_fit
+
+        # 周期性真值日（每7天锚点 + 首末点）
+        min_day = int(np.min(days))
+        interval = max(1, int(cfg.inspect_interval_days))
+        normalized_days = np.round(days - min_day).astype(int)
+        truth_mask = (normalized_days % interval) == 0
+        truth_mask[0] = True
+        truth_mask[-1] = True
+        df["truth_mask"] = truth_mask
 
     elif method == "pchip_smooth":
-        rolling_median = pd.Series(raw_cap_clip).rolling(window=11, center=True, min_periods=1).median()
-        monotone_median = np.minimum.accumulate(rolling_median.bfill().ffill().values)
         unique_days, indices = np.unique(days, return_index=True)
+        unique_monotone = monotone_fit[indices]
         if len(unique_days) >= 4:
-            pchip = PchipInterpolator(unique_days, monotone_median[indices])
+            pchip = PchipInterpolator(unique_days, unique_monotone)
             trend_cap = pchip(days)
         else:
-            trend_cap = monotone_median
+            trend_cap = monotone_fit
 
     else:
         raise ValueError(f"未知伪标签方法: {method}")
+
+    # [7-DAY ITERATION] 插值后再次做保序回归，确保平滑单调递减
+    trend_cap = iso.fit_transform(days, trend_cap)
 
     soh_true = (trend_cap / baseline_cap) * 100.0
     df["baseline_cap"] = baseline_cap
@@ -275,14 +272,32 @@ class SOHDataset(Dataset):
         curr_sc = (np.array(r["curr_sc_raw"], dtype=float) - self.mean) / self.std
         prev_sc = (np.array(r["prev_sc_raw"], dtype=float) - self.mean) / self.std
         y = r["soh_true"] / 100.0
+        # [7-DAY ITERATION] 显式真值日标记
+        is_truth_day = float(r.get("truth_mask", False))
         return (
             torch.tensor(r["curr_fp"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(curr_sc, dtype=torch.float32),
             torch.tensor(r["prev_fp"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(prev_sc, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32),
+            torch.tensor(is_truth_day, dtype=torch.float32),
             r["days"], r["Vehicle"],
         )
+
+
+# [7-DAY ITERATION] 训练时周期性真值注入器（可关闭，保持向后兼容）
+class WeeklyTruthInjector:
+    def __init__(self, mode: str = "weekly", interval_days: int = 7):
+        self.mode = mode
+        self.interval_days = max(1, int(interval_days))
+
+    def inject(self, y_target: torch.Tensor, is_truth_day: torch.Tensor, days: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.mode != "weekly":
+            return y_target, is_truth_day > 0.5
+        day0 = days.min()
+        week_mask = ((days - day0) % self.interval_days) == 0
+        truth_mask = torch.logical_or(is_truth_day > 0.5, week_mask)
+        return y_target, truth_mask
 
 def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
     rows = []
@@ -292,6 +307,8 @@ def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: L
             prev = records[i - 1] if i > 0 else records[i]
             rows.append({
                 "Vehicle": veh, "days": int(r["days"]), "soh_true": float(r["soh_true"]),
+                # [7-DAY ITERATION] 向样本传递真值日标签
+                "truth_mask": bool(r.get("truth_mask", False)),
                 "curr_fp": r["fingerprint"], "curr_sc_raw": [float(r["avg_curr"]), 0.0],# 这里的第二个标量特征暂时占位为0.0，后续可以替换成 avg_temp 或其他有意义的特征，屏蔽温度特征
                 "prev_fp": prev["fingerprint"], "prev_sc_raw": [float(prev["avg_curr"]), 0.0],
             })
@@ -349,16 +366,35 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     model = PIUAE(num_scalars=len(train_rows[0]["curr_sc_raw"])).to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
     mse = nn.MSELoss()
+    # [7-DAY ITERATION] 周期性真值注入模块
+    truth_injector = WeeklyTruthInjector(mode=cfg.truth_injection_mode, interval_days=cfg.inspect_interval_days)
     
     print(f"[{method_name}] 开始训练 PI-UAE 模型...")
     for epoch in range(cfg.epochs):
         model.train()
-        for c_fp, c_sc, p_fp, p_sc, y, _, _ in train_loader:
+        for c_fp, c_sc, p_fp, p_sc, y, is_truth_day, d, _ in train_loader:
             c_fp, c_sc, p_fp, p_sc, y = c_fp.to(device), c_sc.to(device), p_fp.to(device), p_sc.to(device), y.to(device)
+            is_truth_day = is_truth_day.to(device)
+            d = d.to(device)
             y_pred, recon = model(c_fp, c_sc)
             y_prev, _ = model(p_fp, p_sc)
+            y_target, truth_mask = truth_injector.inject(y, is_truth_day, d)
+
+            # [7-DAY ITERATION] 显式拆分：真值监督日 vs 预测自洽日
+            truth_mask_f = truth_mask.float()
+            pred_mask_f = 1.0 - truth_mask_f
+            truth_count = truth_mask_f.sum().clamp(min=1.0)
+            pred_count = pred_mask_f.sum().clamp(min=1.0)
+            supervised_loss = (((y_pred.squeeze() - y_target) ** 2) * truth_mask_f).sum() / truth_count
+            self_consistency_loss = (((y_pred.squeeze() - y_target) ** 2) * pred_mask_f).sum() / pred_count
+
             # 物理约束的惩罚核心：如果今天的预测值大于昨天的预测值，就给予惩罚！
-            loss = mse(y_pred.squeeze(), y) + cfg.lambda_recon * mse(recon, c_fp) + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
+            loss = (
+                cfg.truth_supervision_weight * supervised_loss
+                + cfg.self_consistency_weight * self_consistency_loss
+                + cfg.lambda_recon * mse(recon, c_fp)
+                + cfg.alpha_physics * torch.relu(y_pred.squeeze() - y_prev.squeeze()).mean()
+            )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -375,7 +411,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         model.eval()
         days, y_true, y_pred = [], [], []
         with torch.no_grad():
-            for c_fp, c_sc, _, _, y, d, _ in test_loader:
+            for c_fp, c_sc, _, _, y, _, d, _ in test_loader:
                 p, _ = model(c_fp.to(device), c_sc.to(device))
                 y_pred.extend((p.cpu().numpy().flatten() * 100).tolist())
                 y_true.extend((y.numpy() * 100).tolist())
@@ -424,10 +460,49 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     return metric_df
 
 
+# [7-DAY ITERATION] 检修场景评估器：第0天真值已知，后6天漂移
+def simulate_weekly_inspection(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_dir: str) -> pd.DataFrame:
+    horizon = max(2, int(cfg.weekly_eval_horizon))
+    rows = []
+    for veh, df in sorted(vehicle_frames.items()):
+        if df.empty or "soh_true" not in df.columns:
+            continue
+        dfx = df.sort_values("days").reset_index(drop=True)
+        if len(dfx) < horizon:
+            continue
+
+        day0 = int(dfx["days"].iloc[0])
+        rel = (dfx["days"] - day0).astype(int)
+        truth_days = dfx[rel % max(1, cfg.inspect_interval_days) == 0].index.tolist()
+        if not truth_days:
+            truth_days = [0]
+
+        for idx in truth_days:
+            end_idx = min(idx + horizon, len(dfx))
+            if end_idx - idx < 2:
+                continue
+            base = float(dfx.loc[idx, "soh_true"])
+            chunk = dfx.iloc[idx:end_idx].copy()
+            drift = (chunk["soh_true"].astype(float) - base).abs()
+            pred_window_drift_mae = float(drift.iloc[1:].mean()) if len(drift) > 1 else 0.0
+            rows.append({
+                "Vehicle": veh,
+                "anchor_day": int(chunk["days"].iloc[0]),
+                "window_len": int(len(chunk)),
+                "known_day0_soh": base,
+                "pred_window_drift_mae": pred_window_drift_mae,
+            })
+
+    out_df = pd.DataFrame(rows)
+    if not out_df.empty:
+        out_df.to_csv(os.path.join(output_dir, "weekly_inspection_eval.csv"), index=False)
+    return out_df
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    # 默认跑你最新的“定期校准”思路，顺带跑一个平滑方法作对比
-    parser.add_argument("--pseudo-label-methods", nargs="+", default=["periodic_calibration", "pchip_smooth"])
+    # 默认跑7天检修真值注入 + 平滑方法作对比
+    parser.add_argument("--pseudo-label-methods", nargs="+", default=["weekly_inspection", "pchip_smooth"])
     args = parser.parse_args()
 
     cfg = Config()
@@ -452,6 +527,8 @@ def main() -> None:
         
         if frames:
             train_and_eval(frames, cfg, method_out_dir, method)
+            if method == "weekly_inspection":
+                simulate_weekly_inspection(frames, cfg, method_out_dir)
             print(f"✅ {method} 实验完成！")
 
 if __name__ == "__main__":
