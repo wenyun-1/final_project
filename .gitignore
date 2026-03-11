@@ -14,7 +14,8 @@ __pycache__/
 
 # 运行输出目录
 outputs_ablation/
-outputs_final/
+outputs_final_best/
+outputs_search/
 *.pth
 *.png
 outputs_*/

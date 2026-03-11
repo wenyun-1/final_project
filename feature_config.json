@@ -1,0 +1,22 @@
+{
+    "feature_selection": {
+        "target": "soh_true",
+        "threshold": 0.15,
+        "selected_scalars": [
+            "raw_cap",
+            "soc_delta",
+            "avg_curr",
+            "sub_duration_h",
+            "charge_duration_h"
+        ],
+        "dropped_scalars": [
+            "ic_peak",
+            "voltage_rise_rate",
+            "avg_temp"
+        ],
+        "input_scalar_dim": 5
+    },
+    "model_params": {
+        "regressor_input_dim": 69
+    }
+}
