@@ -240,6 +240,13 @@ def build_pseudo_labels(rows: List[Dict], method: str, cfg: Config = Config()) -
         truth_mask[-1] = True
         df["truth_mask"] = truth_mask
 
+        # 周期性真值日（每7天锚点 + 首末点）
+        normalized_days = np.round(days - min_day).astype(int)
+        truth_mask = (normalized_days % interval) == 0
+        truth_mask[0] = True
+        truth_mask[-1] = True
+        df["truth_mask"] = truth_mask
+
     elif method == "pchip_smooth":
         unique_days, indices = np.unique(days, return_index=True)
         unique_monotone = monotone_fit[indices]
@@ -506,6 +513,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = Config()
+    # [7-DAY ITERATION] 更密集检修场景下适当降低物理惩罚权重
+    cfg.alpha_physics = 0.02 if cfg.truth_injection_mode == "weekly" else cfg.alpha_physics
     set_seed(cfg.seed)
 
     files = collect_files(DATA_DIRS)
