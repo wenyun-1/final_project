@@ -2,7 +2,7 @@
 
 核心思想：
 1) 伪标签：采用 weekly_inspection（模拟每7天检修）
-2) 模型：提升了物理惩罚系数 (alpha_physics=1.0)，强迫模型学习真正的退化趋势，拒绝随温度震荡
+2) 模型：提升了物理惩罚系数 (alpha_physics=2.0)，强迫模型学习真正的退化趋势，拒绝随温度震荡
 3) 评估：自动按方法分目录导出结果，直接生成 SOC 接口文件
 """
 
@@ -45,7 +45,7 @@ class Config:
     learning_rate: float = 5e-4
     lambda_recon: float = 0.5
     # 【核心修改 1】：加大了物理惩罚！如果红线还乱跳，就把这里改成 5.0
-    alpha_physics: float = 0.05
+    alpha_physics: float = 2.0
     smooth_window: int = 15
     seed: int = 42
     min_seg_points: int = 30
@@ -216,37 +216,29 @@ def build_pseudo_labels(rows: List[Dict], method: str, cfg: Config = Config()) -
     # [7-DAY ITERATION] 预置真值掩码（默认无真值注入）
     df["truth_mask"] = False
 
-    # [7-DAY ITERATION] 7天检修锚点生成趋势并导出真值日掩码
+    # [7-DAY ITERATION] 使用较大窗口平滑 + 保序回归，避免阶梯状死区
+    smooth_window = 21
+    rolling_median = pd.Series(raw_cap_clip).rolling(window=smooth_window, center=True, min_periods=1).median().bfill().ffill().to_numpy()
+    iso = IsotonicRegression(increasing=False)
+    monotone_fit = iso.fit_transform(days, rolling_median)
+
     if method == "weekly_inspection":
-        anchor_days = []
-        anchor_caps = []
-        min_day, max_day = int(np.min(days)), int(np.max(days))
-        interval = max(1, int(cfg.inspect_interval_days))
-
-        anchor_days.append(min_day)
-        anchor_caps.append(np.percentile(raw_cap_clip[:max(5, len(raw_cap_clip) // 20)], 85))
-
-        for d in range(min_day + interval, max_day, interval):
-            mask = (days >= d - 2) & (days <= d + 2)
-            if np.any(mask):
-                anchor_days.append(np.median(days[mask]))
-                anchor_caps.append(np.median(raw_cap_clip[mask]))
-
-        anchor_days.append(max_day)
-        anchor_caps.append(np.median(raw_cap_clip[-max(5, len(raw_cap_clip) // 20):]))
-
-        anchor_days = np.array(anchor_days)
-        anchor_caps = np.array(anchor_caps)
-        anchor_caps = np.minimum.accumulate(anchor_caps)
-
-        unique_anchors, u_idx = np.unique(anchor_days, return_index=True)
-        if len(unique_anchors) >= 3:
-            pchip = PchipInterpolator(unique_anchors, anchor_caps[u_idx])
+        unique_days, indices = np.unique(days, return_index=True)
+        unique_monotone = monotone_fit[indices]
+        if len(unique_days) >= 3:
+            pchip = PchipInterpolator(unique_days, unique_monotone)
             trend_cap = pchip(days)
-            trend_cap = np.minimum.accumulate(trend_cap)
         else:
-            trend_cap = pd.Series(raw_cap_clip).rolling(window=7, min_periods=1, center=True).median().values
-            trend_cap = np.minimum.accumulate(trend_cap)
+            trend_cap = monotone_fit
+
+        # 周期性真值日（每7天锚点 + 首末点）
+        min_day = int(np.min(days))
+        interval = max(1, int(cfg.inspect_interval_days))
+        normalized_days = np.round(days - min_day).astype(int)
+        truth_mask = (normalized_days % interval) == 0
+        truth_mask[0] = True
+        truth_mask[-1] = True
+        df["truth_mask"] = truth_mask
 
         # 周期性真值日（每7天锚点 + 首末点）
         normalized_days = np.round(days - min_day).astype(int)
@@ -256,17 +248,19 @@ def build_pseudo_labels(rows: List[Dict], method: str, cfg: Config = Config()) -
         df["truth_mask"] = truth_mask
 
     elif method == "pchip_smooth":
-        rolling_median = pd.Series(raw_cap_clip).rolling(window=11, center=True, min_periods=1).median()
-        monotone_median = np.minimum.accumulate(rolling_median.bfill().ffill().values)
         unique_days, indices = np.unique(days, return_index=True)
+        unique_monotone = monotone_fit[indices]
         if len(unique_days) >= 4:
-            pchip = PchipInterpolator(unique_days, monotone_median[indices])
+            pchip = PchipInterpolator(unique_days, unique_monotone)
             trend_cap = pchip(days)
         else:
-            trend_cap = monotone_median
+            trend_cap = monotone_fit
 
     else:
         raise ValueError(f"未知伪标签方法: {method}")
+
+    # [7-DAY ITERATION] 插值后再次做保序回归，确保平滑单调递减
+    trend_cap = iso.fit_transform(days, trend_cap)
 
     soh_true = (trend_cap / baseline_cap) * 100.0
     df["baseline_cap"] = baseline_cap
