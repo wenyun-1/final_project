@@ -305,11 +305,6 @@ class SOHDataset(Dataset):
             r["Vehicle"],
         )
 
-    test_vehicles = sorted(shuffled[:n_test])
-    remain = [v for v in shuffled if v not in set(test_vehicles)]
-    remain = remain[:n_train]
-    train_vehicles = sorted(remain)
-    return train_vehicles, test_vehicles
 
 
 def build_rows_for_vehicles(vehicle_frames: Dict[str, pd.DataFrame], vehicles: List[str]) -> List[Dict]:
