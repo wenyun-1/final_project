@@ -22,6 +22,7 @@ from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 
 TIME_FORMAT = "mixed"
 
@@ -34,6 +35,13 @@ class ProbeConfig:
     window_size: float = 25.0
     window_step: float = 1.0
     read_chunk_size: int = 200000
+    cc_current_tol: float = 2.0
+    cc_step_tol: float = 2.0
+    cc_min_points: int = 20
+    tail_cut_seconds: float = 40.0
+    ic_voltage_step: float = 0.02
+    ic_savgol_window: int = 11
+    ic_savgol_polyorder: int = 2
 
 
 def normalize_vehicle_name(file_stem: str) -> str:
@@ -141,26 +149,87 @@ def trim_segment_by_soc(seg: pd.DataFrame, soc_start: float, soc_end: float) -> 
     return asc.reset_index(drop=True)
 
 
-def compute_ic_curve(seg: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+def extract_cc_subsegment(seg: pd.DataFrame, cfg: ProbeConfig) -> pd.DataFrame:
+    """从片段中提取最稳定的恒流(CC)子段；遇到电流阶跃/波动自动截断。"""
+    if seg.empty:
+        return seg
+    s = seg.sort_values("DATA_TIME").reset_index(drop=True).copy()
+    cur = s["totalCurrent"].to_numpy()
+    base = float(np.median(cur))
+    # 阈值1：偏离主电流幅值过大（>±2A）
+    stable_amp = np.abs(cur - base) <= cfg.cc_current_tol
+    # 阈值2：相邻采样阶跃过大（>±2A）
+    dcur = np.diff(cur, prepend=cur[0])
+    stable_step = np.abs(dcur) <= cfg.cc_step_tol
+    stable = stable_amp & stable_step
+
+    best_start, best_len = -1, 0
+    start = None
+    for i, flag in enumerate(stable):
+        if flag and start is None:
+            start = i
+        if (not flag or i == len(stable) - 1) and start is not None:
+            end = i if not flag else i + 1
+            ln = end - start
+            if ln > best_len:
+                best_start, best_len = start, ln
+            start = None
+    if best_start < 0 or best_len < cfg.cc_min_points:
+        return s.iloc[0:0].copy()
+    out = s.iloc[best_start : best_start + best_len].copy().reset_index(drop=True)
+    return out
+
+
+def compute_ic_curve(seg: pd.DataFrame, cfg: ProbeConfig) -> Tuple[np.ndarray, np.ndarray]:
     if len(seg) < 5:
         return np.array([]), np.array([])
-    dt_h = seg["DATA_TIME"].diff().dt.total_seconds().fillna(0).to_numpy() / 3600.0
-    curr_a = np.abs(seg["totalCurrent"].to_numpy())
-    dq = curr_a * dt_h
-    q = np.cumsum(dq)
-    v = seg["totalVoltage"].to_numpy()
+    work = seg.sort_values("DATA_TIME").reset_index(drop=True).copy()
 
-    dv = np.diff(v)
-    dq_step = np.diff(q)
-    ok = np.abs(dv) > 1e-4
-    if ok.sum() < 3:
+    # 切掉末端几十秒，避开CV尾段/断开造成的反向尾巴
+    if cfg.tail_cut_seconds > 0:
+        t_sec = (work["DATA_TIME"] - work["DATA_TIME"].iloc[0]).dt.total_seconds().to_numpy()
+        keep = t_sec <= max(0.0, t_sec[-1] - cfg.tail_cut_seconds)
+        if keep.sum() >= 5:
+            work = work.loc[keep].reset_index(drop=True)
+        if len(work) < 5:
+            return np.array([]), np.array([])
+
+    dt_h = work["DATA_TIME"].diff().dt.total_seconds().fillna(0).to_numpy() / 3600.0
+    curr_a = np.abs(work["totalCurrent"].to_numpy())
+    dq = curr_a * dt_h
+    q = np.cumsum(dq).astype(float)
+    v = work["totalVoltage"].to_numpy(dtype=float)
+
+    # 去重并按V单调升序构建Q(V)
+    order = np.argsort(v)
+    v_sorted = v[order]
+    q_sorted = q[order]
+    uniq_v, uniq_idx = np.unique(v_sorted, return_index=True)
+    uniq_q = q_sorted[uniq_idx]
+    if len(uniq_v) < 8:
         return np.array([]), np.array([])
-    x = (v[:-1] + v[1:]) / 2.0
-    y = np.zeros_like(x)
-    y[ok] = dq_step[ok] / dv[ok]
-    # 简单平滑，避免噪点
-    y = pd.Series(y).rolling(7, center=True, min_periods=1).mean().to_numpy()
-    return x[ok], y[ok]
+
+    # 固定电压间隔重采样（默认20mV，可改10mV）
+    step = max(1e-4, float(cfg.ic_voltage_step))
+    grid_v = np.arange(uniq_v.min(), uniq_v.max() + step * 0.5, step)
+    if len(grid_v) < 8:
+        return np.array([]), np.array([])
+    grid_q = np.interp(grid_v, uniq_v, uniq_q)
+
+    # 对V-Q曲线先做 S-G 平滑，再求导
+    win = int(cfg.ic_savgol_window)
+    if win % 2 == 0:
+        win += 1
+    win = min(win, len(grid_q) - 1 if len(grid_q) % 2 == 0 else len(grid_q))
+    if win < 5:
+        return np.array([]), np.array([])
+    if win % 2 == 0:
+        win -= 1
+
+    q_smooth = savgol_filter(grid_q, window_length=win, polyorder=min(cfg.ic_savgol_polyorder, win - 2))
+    dqdv = np.gradient(q_smooth, grid_v)
+    dqdv = pd.Series(dqdv).rolling(5, center=True, min_periods=1).mean().to_numpy()
+    return grid_v, dqdv
 
 
 def plot_window_hist(dfw: pd.DataFrame, veh: str, out_path: str) -> None:
@@ -179,7 +248,7 @@ def plot_window_hist(dfw: pd.DataFrame, veh: str, out_path: str) -> None:
     plt.close()
 
 
-def plot_probe(seg: pd.DataFrame, veh: str, soc_start: float, soc_end: float, out_path: str) -> None:
+def plot_probe(seg: pd.DataFrame, veh: str, soc_start: float, soc_end: float, out_path: str, cfg: ProbeConfig) -> None:
     t = (seg["DATA_TIME"] - seg["DATA_TIME"].iloc[0]).dt.total_seconds().to_numpy() / 60.0
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -206,7 +275,7 @@ def plot_probe(seg: pd.DataFrame, veh: str, soc_start: float, soc_end: float, ou
     ax_r.set_ylabel("Temp (°C)", color="#ff7f0e")
     ax_l.grid(alpha=0.25)
 
-    xv, yic = compute_ic_curve(seg)
+    xv, yic = compute_ic_curve(seg, cfg)
     if len(xv) > 0:
         axes[1, 1].plot(xv, yic, color="#9467bd")
     axes[1, 1].set_title("dQ/dV vs Voltage (IC)")
@@ -245,8 +314,17 @@ def process_vehicle(csv_path: str, cfg: ProbeConfig, output_dir: str) -> Dict:
     if len(cut) < 5:
         return {"vehicle": veh, "segments": len(segs), "status": "trim_too_short", "window": (ws, we)}
 
+    cc_cut = extract_cc_subsegment(cut, cfg)
+    if len(cc_cut) < cfg.cc_min_points:
+        return {
+            "vehicle": veh,
+            "segments": len(segs),
+            "status": "no_cc_subsegment",
+            "window": (ws, we),
+        }
+
     probe_path = os.path.join(output_dir, "probe_plots", f"{veh}_probe_2x2.png")
-    plot_probe(cut, veh, ws, we, probe_path)
+    plot_probe(cc_cut, veh, ws, we, probe_path, cfg)
 
     return {
         "vehicle": veh,
@@ -255,6 +333,7 @@ def process_vehicle(csv_path: str, cfg: ProbeConfig, output_dir: str) -> Dict:
         "best_window_start": ws,
         "best_window_end": we,
         "best_count": int(best["count"]),
+        "cc_points": int(len(cc_cut)),
         "hist_path": hist_path,
         "probe_path": probe_path,
     }
@@ -268,12 +347,22 @@ def main() -> None:
     p.add_argument("--window-step", type=float, default=1.0, help="SOC窗口步长(%)")
     p.add_argument("--min-soc-span", type=float, default=25.0, help="充电片段最小SOC跨度(%)")
     p.add_argument("--max-vehicles", type=int, default=0, help="仅处理前N辆车，0表示全部")
+    p.add_argument("--cc-current-tol", type=float, default=2.0, help="恒流段电流偏差阈值(A)")
+    p.add_argument("--cc-step-tol", type=float, default=2.0, help="恒流段相邻采样阶跃阈值(A)")
+    p.add_argument("--tail-cut-seconds", type=float, default=40.0, help="IC计算前裁掉末端秒数")
+    p.add_argument("--ic-voltage-step", type=float, default=0.02, help="IC计算电压重采样步长(V)")
+    p.add_argument("--ic-savgol-window", type=int, default=11, help="S-G平滑窗口(奇数)")
     args = p.parse_args()
 
     cfg = ProbeConfig(
         window_size=args.window_size,
         window_step=args.window_step,
         min_soc_span=args.min_soc_span,
+        cc_current_tol=args.cc_current_tol,
+        cc_step_tol=args.cc_step_tol,
+        tail_cut_seconds=args.tail_cut_seconds,
+        ic_voltage_step=args.ic_voltage_step,
+        ic_savgol_window=args.ic_savgol_window,
     )
 
     files = collect_files(args.data_dirs)
