@@ -13,27 +13,18 @@
 - `data/LFP604EV1.csv`
 - `data/LFP604EV12.csv`
 
-当前 `soh_final_pipeline.py` 已做两件关键处理：
+当前 `soh_final_pipeline.py` 已做三件关键处理：
 
 1. 默认只扫描 `data`（不再默认读 `samples`）；
-2. 统一命名为 `LFP604EV*.csv` 后，车辆匹配和 SOH→SOC 对齐流程会更稳定。
+2. 充电片段按每次充电过程的 **SOC 75%→90%** 区间截取；
+3. 使用该区间的安时积分折算容量，并将每个充电片段计算出的 SOH 都作为训练标签（不再按 7 天更新标签）。
 
 ---
 
 ## 2. 第三章 SOH 主流程（推荐）
 
 ```bash
-python soh_final_pipeline.py \
-  --data-dirs data \
-  --read-chunk-size 200000 \
-  --epochs 120 \
-  --split-mode cross_vehicle \
-  --train-vehicle-count 9 \
-  --test-vehicle-count 3 \
-  --test-vehicles LFP604EV3 LFP604EV10 LFP604EV9 \
-  --log-every-epoch 10 \
-  --smooth-window 15 \
-  --output outputs_final
+python soh_final_pipeline.py --pseudo-label-methods weekly_inspection pchip_smooth
 ```
 
 > 默认会把每辆车的“充电片段提取结果”缓存到 `outputs_final/segment_cache/`。
@@ -53,18 +44,12 @@ python soh_final_pipeline.py --data-dirs data --no-segment-cache
 
 ### 伪标签方式切换（用于对比“线性过硬”问题）
 
-默认是 `robust_linear`（与旧结果一致）。可尝试：
+默认会运行 `weekly_inspection` 与 `pchip_smooth` 两种伪标签策略做对比。
 
-- `rolling_monotone`：滚动中位数 + 单调下降约束；
-- `isotonic_monotone`：保序回归（非线性，但保证整体不升）。
-
-示例：
+示例（仅跑 `weekly_inspection` 伪标签策略）：
 
 ```bash
-python soh_final_pipeline.py \
-  --data-dirs data \
-  --pseudo-label-method isotonic_monotone \
-  --output outputs_final_iso
+python soh_final_pipeline.py --pseudo-label-methods weekly_inspection
 ```
 
 ### 训练集不变时的快速运行（跳过训练）
@@ -102,7 +87,7 @@ python soh_compare_experiments.py \
 ### 说明
 
 - `split-mode=cross_vehicle`：按车辆划分训练/测试，验证可迁移性；
-- 默认采用 **严格** `9` 车训练 + `3` 车测试（测试车固定为 `EV3/EV10/EV9`）；
+- 默认采用 **固定跨车测试集**：`EV1` 与 `EV8`（即 `LFP604EV1/LFP604EV8`）；
 - 若内存紧张，可将 `--read-chunk-size` 调小（如 `50000` 或 `20000`）；
 - 运行中会打印 `[Load]`、`[Split]`、`[Data]`、`[Train]` 进度信息，便于确认程序未卡住；
 - 伪标签趋势拟合已加入数值稳定和退化回退机制，降低 `RankWarning` 风险。
@@ -164,7 +149,7 @@ python SOC_Test_Innovation.py \
 ## 4. 当前实验口径（强烈建议）
 
 - SOH：跨车辆训练/测试（不做同车随机切分作为主结果）；
-- SOH：严格 10 车训练 + 2 车测试，并导出 `vehicle_split.csv`；
+- SOH：固定跨车辆训练/测试，测试车为 `EV1/EV8`，且每个充电片段均参与标签监督；
 - SOC：默认读取同一 `vehicle_split.csv`，训练仅使用 train 车辆，测试车从 test 车辆中自动选择；
 - SOC：默认仅放电段训练与评估（避免出现与任务定义不一致的 SOC 上升片段）；
 - `samples/`：仅作为格式样例，不参与正式实验统计。
