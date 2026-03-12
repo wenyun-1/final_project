@@ -50,12 +50,7 @@ class Config:
     seed: int = 42
     min_seg_points: int = 30
     max_gap_seconds: int = 60
-<<<<<<< HEAD
     min_soc_delta: float = 25.0#之前为20.0
-=======
-    min_soc_delta: float = 20.0
-    max_curr_std: float = 8.0
->>>>>>> 4234a2d6544221b06132c84dfd277f23027bef8b
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
