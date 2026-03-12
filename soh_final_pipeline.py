@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader, Dataset
 TIME_FORMAT = "mixed"
 DATA_DIRS = ["data"]
 DEFAULT_OUTPUT_DIR = "outputs_final"
+SEGMENT_CACHE_TAG = "soc75_90_v1"
 
 SOC_WINDOW_START = 75.0
 SOC_WINDOW_END = 90.0
@@ -39,7 +40,7 @@ class Config:
     epochs: int = 120
     learning_rate: float = 5e-4
     lambda_recon: float = 0.5
-    alpha_physics: float = 2.0
+    alpha_physics: float = 0.02
     smooth_window: int = 15
     seed: int = 42
     min_seg_points: int = 30
@@ -47,6 +48,8 @@ class Config:
     min_soc_delta: float = 10.0
     fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV1", "LFP604EV8"])
     read_chunk_size: int = 200000
+    use_segment_cache: bool = True
+    refresh_segment_cache: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -162,13 +165,42 @@ def extract_segments_from_file(path: str, cfg: Config) -> List[Dict]:
     return out
 
 
-def load_all_raw_segments(files: List[str], cfg: Config) -> Dict[str, List[Dict]]:
+def _save_segments_cache(path: str, segs: List[Dict]) -> None:
+    if not segs:
+        return
+    rows, fps = [], []
+    for seg in segs:
+        rows.append({k: v for k, v in seg.items() if k != "fingerprint"})
+        fps.append(np.asarray(seg["fingerprint"], dtype=np.float32))
+    np.savez_compressed(path, meta=np.array(rows, dtype=object), fingerprint=np.stack(fps, axis=0))
+
+
+def _load_segments_cache(path: str) -> List[Dict]:
+    z = np.load(path, allow_pickle=True)
+    meta, fps = list(z["meta"]), z["fingerprint"]
+    out = []
+    for i, m in enumerate(meta):
+        d = dict(m)
+        d["fingerprint"] = fps[i]
+        out.append(d)
+    return out
+
+
+def load_all_raw_segments(files: List[str], cfg: Config, cache_dir: str) -> Dict[str, List[Dict]]:
+    os.makedirs(cache_dir, exist_ok=True)
     seg_by_vehicle: Dict[str, List[Dict]] = {}
     for i, f in enumerate(files, 1):
         veh_file = os.path.splitext(os.path.basename(f))[0]
         veh = normalize_vehicle_name(veh_file)
-        segs = extract_segments_from_file(f, cfg)
-        print(f"[Data] {i}/{len(files)} {veh_file} -> 强制重算片段数 {len(segs)}")
+        cache_path = os.path.join(cache_dir, f"{veh}.npz")
+        if cfg.use_segment_cache and (not cfg.refresh_segment_cache) and os.path.exists(cache_path):
+            segs = _load_segments_cache(cache_path)
+            print(f"[Data] {i}/{len(files)} {veh_file} -> 从缓存读取片段数 {len(segs)}")
+        else:
+            segs = extract_segments_from_file(f, cfg)
+            if cfg.use_segment_cache:
+                _save_segments_cache(cache_path, segs)
+            print(f"[Data] {i}/{len(files)} {veh_file} -> 提取片段数 {len(segs)}")
         if segs:
             seg_by_vehicle.setdefault(veh, []).extend(segs)
     return seg_by_vehicle
@@ -354,7 +386,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
             ax_l, ax_r = axes[i, 0], axes[i, 1]
             ax_l.scatter(dat["days"], dat["y_pred_raw"], s=12, c="#4e79a7", alpha=0.5)
             ax_l.plot(dat["days"], dat["y_pred_filtered"], c="#e15759", lw=2.0, label="Pred Trend")
-            ax_l.plot(dat["days"], dat["y_true"], c="black", lw=1.4, alpha=0.8, label="Label")
+            ax_l.scatter(dat["days"], dat["y_true"], s=12, c="#9e9e9e", alpha=0.9, label="Label")
             ax_l.set_title(f"{veh} SOH")
             ax_l.legend()
             err = dat["y_pred_filtered"] - dat["y_true"]
@@ -377,7 +409,8 @@ def main() -> None:
         print("❌ 未找到CSV数据")
         return
 
-    raw_segs_by_vehicle = load_all_raw_segments(files, cfg)
+    cache_dir = os.path.join(DEFAULT_OUTPUT_DIR, f"segment_cache_{SEGMENT_CACHE_TAG}")
+    raw_segs_by_vehicle = load_all_raw_segments(files, cfg, cache_dir)
     if not raw_segs_by_vehicle:
         print("❌ 数据清洗后无可用片段")
         return
