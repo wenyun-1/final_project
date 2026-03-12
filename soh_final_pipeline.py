@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import argparse
 import glob
 import os
 import random
@@ -27,6 +26,7 @@ from torch.utils.data import DataLoader, Dataset
 TIME_FORMAT = "mixed"
 DATA_DIRS = ["data"]
 DEFAULT_OUTPUT_DIR = "outputs_final"
+SEGMENT_CACHE_TAG = "soc75_90_v1"
 
 # 充电片段 SOC 截取窗口
 SOC_WINDOW_START = 75.0
@@ -204,12 +204,12 @@ class PIUAE(nn.Module):
         self.encoder = nn.Sequential(
             nn.Conv1d(1, 16, 3, 1, 1), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2),
             nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Flatten(), nn.Linear(32 * 25, 64), nn.ReLU()
+            nn.Flatten(), nn.Linear(32 * 25, 64), nn.ReLU(),
         )
         self.decoder = nn.Sequential(
             nn.Linear(64, 32 * 25), nn.ReLU(), nn.Unflatten(1, (32, 25)),
             nn.Upsample(scale_factor=2), nn.Conv1d(32, 16, 3, 1, 1), nn.ReLU(),
-            nn.Upsample(scale_factor=2), nn.Conv1d(16, 1, 3, 1, 1), nn.Sigmoid()
+            nn.Upsample(scale_factor=2), nn.Conv1d(16, 1, 3, 1, 1), nn.Sigmoid(),
         )
         self.regressor = nn.Sequential(
             nn.Linear(64 + 2, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.2),
