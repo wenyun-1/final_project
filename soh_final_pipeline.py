@@ -162,11 +162,20 @@ def build_pseudo_labels(rows: List[Dict], robust_linear: bool = True) -> pd.Data
 
 class SOHDataset(Dataset):
     def __init__(self, frame: pd.DataFrame, is_train: bool, split_mod: int, scaler_path: str):
-        all_rows = frame.to_dict("records")
+        all_rows = frame.sort_values("days").reset_index(drop=True).to_dict("records")
+        aligned_rows = []
+        for i, row in enumerate(all_rows):
+            prev = all_rows[max(0, i - 1)]
+            enriched = dict(row)
+            enriched["prev_fingerprint"] = prev["fingerprint"]
+            enriched["prev_avg_curr"] = prev["avg_curr"]
+            enriched["prev_avg_temp"] = prev["avg_temp"]
+            aligned_rows.append(enriched)
+
         if is_train:
-            rows = [r for i, r in enumerate(all_rows) if i % split_mod != 0]
+            rows = [r for i, r in enumerate(aligned_rows) if i % split_mod != 0]
         else:
-            rows = [r for i, r in enumerate(all_rows) if i % split_mod == 0]
+            rows = [r for i, r in enumerate(aligned_rows) if i % split_mod == 0]
 
         if is_train:
             scalars = np.array([[r["avg_curr"], r["avg_temp"]] for r in rows])
@@ -184,14 +193,13 @@ class SOHDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.rows[idx]
-        prev = self.rows[max(0, idx - 1)]
         curr_sc = (np.array([r["avg_curr"], r["avg_temp"]]) - self.mean) / self.std
-        prev_sc = (np.array([prev["avg_curr"], prev["avg_temp"]]) - self.mean) / self.std
+        prev_sc = (np.array([r["prev_avg_curr"], r["prev_avg_temp"]]) - self.mean) / self.std
         y = r["soh_true"] / 100.0
         return (
             torch.tensor(r["fingerprint"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(curr_sc, dtype=torch.float32),
-            torch.tensor(prev["fingerprint"], dtype=torch.float32).unsqueeze(0),
+            torch.tensor(r["prev_fingerprint"], dtype=torch.float32).unsqueeze(0),
             torch.tensor(prev_sc, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32),
             r["days"],
