@@ -36,6 +36,8 @@ DEFAULT_OUTPUT_DIR = "outputs_final"
 
 V_START = 538.0
 V_END = 558.0
+SOC_WINDOW_START = 75.0
+SOC_WINDOW_END = 90.0
 
 
 @dataclass
@@ -50,13 +52,13 @@ class Config:
     seed: int = 42
     min_seg_points: int = 30
     max_gap_seconds: int = 60
-    min_soc_delta: float = 20.0
+    min_soc_delta: float = 10.0
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
     train_vehicle_count: int = 10
     test_vehicle_count: int = 2
     # 固定测试集
-    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV11", "LFP604EV12"])
+    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV1", "LFP604EV8"])
     read_chunk_size: int = 200000
     use_segment_cache: bool = True
     refresh_segment_cache: bool = False
@@ -93,32 +95,34 @@ def normalize_vehicle_name(file_stem: str) -> str:
 def _extract_from_one_segment(records: List[Dict], cfg: Config) -> Dict | None:
     if len(records) <= cfg.min_seg_points: return None
     df_seg = pd.DataFrame(records)
-    if df_seg["totalVoltage"].min() >= V_START or df_seg["totalVoltage"].max() <= V_END: return None
-    idx_s = (df_seg["totalVoltage"] - V_START).abs().idxmin()
-    idx_e = (df_seg["totalVoltage"] - V_END).abs().idxmin()
+    soc_series = df_seg["SOC"].to_numpy(dtype=float)
+    idx_s = int(np.argmin(np.abs(soc_series - SOC_WINDOW_START)))
+    idx_e = int(np.argmin(np.abs(soc_series - SOC_WINDOW_END)))
     if idx_e <= idx_s: return None
-    df_sub = df_seg.loc[idx_s:idx_e].copy()
+    df_sub = df_seg.iloc[idx_s:idx_e + 1].copy()
     if len(df_sub) <= 10: return None
     dt = df_sub["DATA_TIME"].diff().dt.total_seconds().fillna(10)
     if dt.max() > cfg.max_gap_seconds: return None
-    soc_delta = df_seg["SOC"].iloc[-1] - df_seg["SOC"].iloc[0]
+    soc_delta = float(df_sub["SOC"].iloc[-1] - df_sub["SOC"].iloc[0])
     if soc_delta <= cfg.min_soc_delta: return None
 
-    curr_abs = df_seg["totalCurrent"].abs()
-    dt_full = df_seg["DATA_TIME"].diff().dt.total_seconds().fillna(10)
-    
-    # 这里正是利用了 SOC 差值计算出的每次充电片段的“观测容量”
+    curr_abs = df_sub["totalCurrent"].abs()
+    dt_full = dt
+
+    # 基于 SOC 75%->90% 的观测容量折算整包容量，并作为 SOH 伪标签来源
     ah = (curr_abs * dt_full).sum() / 3600
     raw_cap = ah / (soc_delta / 100.0)
 
     v_seq = df_sub["totalVoltage"].values
     f_interp = interp1d(np.linspace(0, 1, len(v_seq)), v_seq, kind="linear")
-    fingerprint = (f_interp(np.linspace(0, 1, 100)) - V_START) / (V_END - V_START)
+    fp_raw = f_interp(np.linspace(0, 1, 100))
+    fp_min, fp_max = float(np.min(fp_raw)), float(np.max(fp_raw))
+    fingerprint = (fp_raw - fp_min) / max(fp_max - fp_min, 1e-6)
 
     dt_sub = df_sub["DATA_TIME"].diff().dt.total_seconds().fillna(10)
     charge_duration_h = float(dt_full.sum() / 3600.0)
     sub_duration_h = float(dt_sub.sum() / 3600.0)
-    voltage_rise_rate = float((V_END - V_START) / max(sub_duration_h, 1e-6))
+    voltage_rise_rate = float((df_sub["totalVoltage"].iloc[-1] - df_sub["totalVoltage"].iloc[0]) / max(sub_duration_h, 1e-6))
 
     q_inc = (df_sub["totalCurrent"].abs().values * dt_sub.values) / 3600.0
     q_cum = np.cumsum(q_inc)
