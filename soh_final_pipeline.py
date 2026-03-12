@@ -50,13 +50,18 @@ class Config:
     seed: int = 42
     min_seg_points: int = 30
     max_gap_seconds: int = 60
+<<<<<<< HEAD
     min_soc_delta: float = 25.0#之前为20.0
+=======
+    min_soc_delta: float = 20.0
+    max_curr_std: float = 8.0
+>>>>>>> 4234a2d6544221b06132c84dfd277f23027bef8b
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
     train_vehicle_count: int = 9
-    test_vehicle_count: int = 3
-    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV3", "LFP604EV10", "LFP604EV9"])
+    test_vehicle_count: int = 2
+    fixed_test_vehicles: List[str] = field(default_factory=lambda: ["LFP604EV3", "LFP604EV9"])
     read_chunk_size: int = 200000
     log_every_epoch: int = 10
     use_segment_cache: bool = True
@@ -130,6 +135,11 @@ def _extract_from_one_segment(records: List[Dict], cfg: Config) -> Dict | None:
 
     soc_delta = df_seg["SOC"].iloc[-1] - df_seg["SOC"].iloc[0]
     if soc_delta <= cfg.min_soc_delta:
+        return None
+
+    # 电流稳定性筛选：电流波动过大则丢弃该片段
+    curr_std = float(df_seg["totalCurrent"].std(ddof=0))
+    if np.isnan(curr_std) or curr_std > cfg.max_curr_std:
         return None
 
     curr_abs = df_seg["totalCurrent"].abs()
@@ -688,19 +698,24 @@ def build_vehicle_frames(files: List[str], cfg: Config, output_dir: str) -> Dict
 
 
 def main() -> None:
+    global V_START, V_END
     sanity_check_source_structure()
     parser = argparse.ArgumentParser(description="SOH终极路线复现实验脚本")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smooth-window", type=int, default=15)
     parser.add_argument("--split-mode", choices=["cross_vehicle", "intra_vehicle"], default="cross_vehicle")
     parser.add_argument("--test-vehicle-ratio", type=float, default=0.3)
     parser.add_argument("--train-vehicle-count", type=int, default=9, help="跨车训练车辆数（<=0 表示不限制）")
-    parser.add_argument("--test-vehicle-count", type=int, default=3, help="跨车测试车辆数（<=0 表示按比例）")
-    parser.add_argument("--test-vehicles", nargs="*", default=["LFP604EV3", "LFP604EV10", "LFP604EV9"], help="固定测试车辆列表")
+    parser.add_argument("--test-vehicle-count", type=int, default=2, help="跨车测试车辆数（<=0 表示按比例）")
+    parser.add_argument("--test-vehicles", nargs="*", default=["LFP604EV3", "LFP604EV9"], help="固定测试车辆列表")
     parser.add_argument("--data-dirs", nargs="+", default=DATA_DIRS, help="SOH原始数据目录列表（默认: data data1）")
     parser.add_argument("--read-chunk-size", type=int, default=200000, help="分块读取行数，内存不足时可调小")
+    parser.add_argument("--v-start", type=float, default=V_START, help="电压窗口起点")
+    parser.add_argument("--v-end", type=float, default=V_END, help="电压窗口终点")
+    parser.add_argument("--max-curr-std", type=float, default=8.0, help="片段内电流标准差上限，超出则丢弃")
     parser.add_argument("--log-every-epoch", type=int, default=10, help="每隔多少个epoch打印训练进度")
     parser.add_argument("--no-segment-cache", action="store_true", help="不使用充电片段缓存")
     parser.add_argument("--refresh-segment-cache", action="store_true", help="强制重建充电片段缓存")
@@ -709,6 +724,7 @@ def main() -> None:
 
     cfg = Config(
         epochs=args.epochs,
+        learning_rate=args.learning_rate,
         seed=args.seed,
         smooth_window=args.smooth_window,
         split_mode=args.split_mode,
@@ -717,11 +733,17 @@ def main() -> None:
         test_vehicle_count=args.test_vehicle_count,
         fixed_test_vehicles=args.test_vehicles,
         read_chunk_size=args.read_chunk_size,
+        max_curr_std=args.max_curr_std,
         log_every_epoch=args.log_every_epoch,
         use_segment_cache=(not args.no_segment_cache),
         refresh_segment_cache=args.refresh_segment_cache,
         reuse_if_same_trainset=args.reuse_if_same_trainset,
     )
+
+    V_START = float(args.v_start)
+    V_END = float(args.v_end)
+    if V_END <= V_START:
+        raise ValueError(f"电压窗口非法：v_end({V_END}) 必须大于 v_start({V_START})")
     set_seed(cfg.seed)
 
     os.makedirs(args.output, exist_ok=True)
