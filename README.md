@@ -17,7 +17,7 @@
 
 1. 默认只扫描 `data`（不再默认读 `samples`）；
 2. 充电片段按每次充电过程的 **SOC 75%→90%** 区间截取；
-3. 使用该区间的安时积分折算容量并生成 SOH 伪标签，车辆匹配和 SOH→SOC 对齐流程更稳定。
+3. 使用该区间的安时积分折算容量，并将每个充电片段计算出的 SOH 都作为训练标签（不再按 7 天更新标签）。
 
 ---
 
@@ -46,7 +46,7 @@ python soh_final_pipeline.py --data-dirs data --no-segment-cache
 
 默认会运行 `weekly_inspection` 与 `pchip_smooth` 两种伪标签策略做对比。
 
-示例（仅跑 7 天检修策略）：
+示例（仅跑 `weekly_inspection` 伪标签策略）：
 
 ```bash
 python soh_final_pipeline.py --pseudo-label-methods weekly_inspection
@@ -149,7 +149,7 @@ python SOC_Test_Innovation.py \
 ## 4. 当前实验口径（强烈建议）
 
 - SOH：跨车辆训练/测试（不做同车随机切分作为主结果）；
-- SOH：固定跨车辆训练/测试，测试车为 `EV1/EV8`；
+- SOH：固定跨车辆训练/测试，测试车为 `EV1/EV8`，且每个充电片段均参与标签监督；
 - SOC：默认读取同一 `vehicle_split.csv`，训练仅使用 train 车辆，测试车从 test 车辆中自动选择；
 - SOC：默认仅放电段训练与评估（避免出现与任务定义不一致的 SOC 上升片段）；
 - `samples/`：仅作为格式样例，不参与正式实验统计。
