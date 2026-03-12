@@ -45,12 +45,12 @@ class Config:
     epochs: int = 120
     learning_rate: float = 5e-4
     lambda_recon: float = 0.5
-    alpha_physics: float = 0.02
-    smooth_window: int = 15
+    alpha_physics: float = 0.03#之前为0.02
+    smooth_window: int = 21#之前为15
     seed: int = 42
     min_seg_points: int = 30
     max_gap_seconds: int = 60
-    min_soc_delta: float = 20.0
+    min_soc_delta: float = 25.0#之前为20.0
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
@@ -486,7 +486,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
     np.savez(os.path.join(output_dir, "global_scaler.npz"), mean=mean, std=std)
 
     train_ds = SOHDataset(train_rows, mean=mean, std=std)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     print(f"[Data] 训练样本数: {len(train_rows)} | 测试样本数: {len(test_rows)}")
 
     signature = {
@@ -550,8 +550,7 @@ def train_and_eval(vehicle_frames: Dict[str, pd.DataFrame], cfg: Config, output_
         if len(veh_rows) < 5:
             continue
         test_ds = SOHDataset(veh_rows, mean=mean, std=std)
-        test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
-
+        test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
         model.eval()
         days, y_true, y_pred = [], [], []
         with torch.no_grad():
