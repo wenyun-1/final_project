@@ -41,16 +41,17 @@ V_END = 558.0
 
 @dataclass
 class Config:
+    max_curr_std: float | None = None
     batch_size: int = 32
     epochs: int = 120
     learning_rate: float = 5e-4
     lambda_recon: float = 0.5
-    alpha_physics: float = 0.03#之前为0.02
-    smooth_window: int = 21#之前为15
+    alpha_physics: float = 0.03 # 之前为0.02
+    smooth_window: int = 21 # 之前为15
     seed: int = 42
     min_seg_points: int = 30
     max_gap_seconds: int = 60
-    min_soc_delta: float = 25.0#之前为20.0
+    min_soc_delta: float = 25.0 # 之前为20.0
     train_split_mod: int = 5
     split_mode: str = "cross_vehicle"
     test_vehicle_ratio: float = 0.3
@@ -62,6 +63,7 @@ class Config:
     use_segment_cache: bool = True
     refresh_segment_cache: bool = False
     reuse_if_same_trainset: bool = False
+
 
 
 def set_seed(seed: int) -> None:
